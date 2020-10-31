@@ -1,0 +1,15 @@
+[submodule "parlaylib"]
+	path = parlaylib
+	url = https://github.com/cmuparlay/parlaylib.git
+[submodule "ParallelTools"]
+	path = ParallelTools
+	url = git@github.com:wheatman/ParallelTools.git
+[submodule "EdgeMapVertexMap"]
+	path = EdgeMapVertexMap
+	url = git@github.com:wheatman/EdgeMapVertexMap.git
+[submodule "tlx"]
+	path = tlx
+	url = https://github.com/tlx/tlx.git
+[submodule "StructOfArrays"]
+	path = StructOfArrays
+	url = git@github.com:wheatman/StructOfArrays.git

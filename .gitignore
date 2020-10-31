@@ -1,0 +1,14 @@
+.vscode/
+basic
+profile
+opt
+perf.*
+del*
+*.profdata
+*.profraw
+data/
+*.csv
+*.out
+aspen/
+test_out/
+build/
