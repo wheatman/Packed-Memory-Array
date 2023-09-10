@@ -1,6 +1,5 @@
 #pragma once
 
-#include "helpers.hpp"
 #include <cstdint>
 #include <iostream> // cout
 #include <string>
@@ -25,7 +24,11 @@ class timer {
 #if CYCLE_TIMER == 1
   static inline uint64_t get_time() { return __rdtsc(); }
 #else
-  static inline uint64_t get_time() { return get_usecs(); }
+  static inline uint64_t get_time() {
+    struct timeval st {};
+    gettimeofday(&st, nullptr);
+    return static_cast<uint64_t>(st.tv_sec * 1000000 + st.tv_usec);
+  }
 #endif
 
 public:

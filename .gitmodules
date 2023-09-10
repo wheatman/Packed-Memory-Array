@@ -1,6 +1,6 @@
 [submodule "parlaylib"]
 	path = parlaylib
-	url = https://github.com/cmuparlay/parlaylib.git
+	url = https://github.com/ParAlg/parlaylib.git
 [submodule "ParallelTools"]
 	path = ParallelTools
 	url = git@github.com:wheatman/ParallelTools.git

@@ -1,7 +1,6 @@
 #ifndef HELPERS_H
 #define HELPERS_H
 
-#include "ParallelTools/parallel.h"
 #include <array>
 #include <atomic>
 #include <cstdint>
