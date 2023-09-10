@@ -1,8 +1,9 @@
-#include "CPMA.hpp"
-#include "leaf.hpp"
-#include "test.hpp"
+#include "PMA/CPMA.hpp"
+#include "PMA/internal/leaf.hpp"
+#include "PMA/internal/test.hpp"
 
 #include <iostream>
+#include <limits>
 
 #if !defined(KEY_TYPE)
 #define KEY_TYPE uint64_t
@@ -27,7 +28,12 @@ static constexpr bool store_density = true;
 static constexpr bool store_density = false;
 #endif
 
-using traits = PMA_traits<leaf, head_form, B_size, store_density>;
+#if SUPPORT_RANK
+static constexpr bool support_rank = true;
+#else
+static constexpr bool support_rank = false;
+#endif
+using traits = PMA_traits<leaf, head_form, B_size, store_density, support_rank>;
 using PMA_Type = CPMA<traits>;
 
 int main(int32_t argc, char *argv[]) {
@@ -65,12 +71,16 @@ int main(int32_t argc, char *argv[]) {
   if (std::string("v_batch") == argv[1]) {
 
     uint64_t num_elements_start = 100000;
-    if (argc == 3) {
+    if (argc >= 3) {
       num_elements_start = atoll(argv[2]);
+    }
+    bool insert_sorted = false;
+    if (argc >= 4) {
+      insert_sorted = atoll(argv[3]);
     }
 
     std::cout << "batch bench test\n";
-    if (batch_bench<traits>(num_elements_start, 40, 5, true)) {
+    if (batch_bench<traits>(num_elements_start, 40, 5, true, insert_sorted)) {
       return 1;
     }
   }
@@ -107,7 +117,7 @@ int main(int32_t argc, char *argv[]) {
   }
   if constexpr (std::is_same_v<key_type, uint64_t>) {
     if (std::string("graph") == argv[1]) {
-      real_graph<traits>(argv[2], atoi(argv[3]), atoi(argv[4]), atoi(argv[5]));
+      real_graph<traits>(argv[2], atoi(argv[3]), atoi(argv[4]), atoll(argv[5]));
     }
   }
   if (std::string("scan") == argv[1]) {
@@ -119,16 +129,36 @@ int main(int32_t argc, char *argv[]) {
   }
 
   if (std::string("batch_bench") == argv[1]) {
-    batch_bench<traits>(atoll(argv[2]), 40, 10);
+    uint64_t trials = 10;
+    if (argc >= 4) {
+      trials = atoll(argv[3]);
+    }
+    bool verify = false;
+    if (argc >= 5) {
+      verify = atoll(argv[4]);
+    }
+    bool insert_sorted = false;
+    if (argc >= 6) {
+      insert_sorted = atoll(argv[5]);
+    }
+    batch_bench<traits>(atoll(argv[2]), 40, trials, verify, insert_sorted);
   }
   if (std::string("batch") == argv[1]) {
 
     uint64_t trials = 10;
-    if (argc == 5) {
+    if (argc >= 5) {
       trials = atoll(argv[4]);
     }
-    auto results =
-        batch_test<traits>(atoll(argv[2]), atoll(argv[3]), 40, trials);
+    bool verify = false;
+    if (argc >= 6) {
+      verify = atoll(argv[5]);
+    }
+    bool insert_sorted = false;
+    if (argc >= 7) {
+      insert_sorted = atoll(argv[6]);
+    }
+    auto results = batch_test<traits>(atoll(argv[2]), atoll(argv[3]), 40,
+                                      trials, verify, insert_sorted);
     std::cout << (double)std::get<0>(results) / 1000000 << ", "
               << (double)std::get<1>(results) / 1000000 << "\n";
   }
@@ -154,30 +184,52 @@ int main(int32_t argc, char *argv[]) {
     std::seed_seq s;
     uint64_t num_items = atoll(argv[2]);
     uint64_t percent_ordered = atoll(argv[3]);
+    if (num_items > std::numeric_limits<key_type>::max()) {
+      std::cout << "num items is too big for the requested type\n";
+      return -1;
+    }
 
-    test_cpma_ordered_and_unordered_insert<traits>(num_items, percent_ordered,
-                                                   s, 5);
+    test_cpma_ordered_and_unordered_insert<traits>((key_type)num_items,
+                                                   percent_ordered, s, 5);
 
-    test_btree_ordered_and_unordered_insert<key_type>(num_items,
+    test_btree_ordered_and_unordered_insert<key_type>((key_type)num_items,
                                                       percent_ordered, s, 5);
   }
 
   if (std::string("multi_seq") == argv[1]) {
     uint64_t num_items = atoll(argv[2]);
     uint64_t groups = atoll(argv[3]);
+    if (num_items > std::numeric_limits<key_type>::max()) {
+      std::cout << "num items is too big for the requested type\n";
+      return -1;
+    }
+    if (groups > std::numeric_limits<key_type>::max()) {
+      std::cout << "groups is too big for the requested type\n";
+      return -1;
+    }
 
-    test_cpma_multi_seq_insert<traits>(num_items, groups);
+    test_cpma_multi_seq_insert<traits>((key_type)num_items, (key_type)groups);
 
-    test_btree_multi_seq_insert<key_type>(num_items, groups);
+    test_btree_multi_seq_insert<key_type>((key_type)num_items,
+                                          (key_type)groups);
   }
 
   if (std::string("bulk") == argv[1]) {
     uint64_t num_items = atoll(argv[2]);
     uint64_t num_per = atoll(argv[3]);
 
-    test_cpma_bulk_insert<traits>(num_items, num_per);
+    if (num_items > std::numeric_limits<key_type>::max()) {
+      std::cout << "num items is too big for the requested type\n";
+      return -1;
+    }
+    if (num_per > std::numeric_limits<key_type>::max()) {
+      std::cout << "num_per is too big for the requested type\n";
+      return -1;
+    }
 
-    test_btree_bulk_insert<key_type>(num_items, num_per);
+    test_cpma_bulk_insert<traits>((key_type)num_items, (key_type)num_per);
+
+    test_btree_bulk_insert<key_type>((key_type)num_items, (key_type)num_per);
   }
   if (std::string("find") == argv[1]) {
     find_bench<traits>(atoll(argv[2]), atoll(argv[3]), 40, 5, false);
@@ -211,6 +263,13 @@ int main(int32_t argc, char *argv[]) {
     uint64_t num_ranges = atoll(argv[3]);
     uint64_t range_size = atoll(argv[4]);
 
+    if (num_ranges > std::numeric_limits<key_type>::max()) {
+      std::cout << "num_ranges is too big for the requested type\n";
+    }
+    if (range_size > std::numeric_limits<key_type>::max()) {
+      std::cout << "range_size is too big for the requested type\n";
+    }
+
     uint64_t trials = 5;
     if (argc == 6) {
       trials = atoll(argv[5]);
@@ -220,8 +279,9 @@ int main(int32_t argc, char *argv[]) {
     std::seed_seq seed1{0};
     std::seed_seq seed2{1};
 
-    map_range_single<CPMA<traits>>(num_elements_start, num_ranges, range_size,
-                                   40, trials, seed1, seed2);
+    map_range_single<CPMA<traits>>(num_elements_start, (key_type)num_ranges,
+                                   (key_type)range_size, 40, trials, seed1,
+                                   seed2);
 
     // map_range_bench<tlx::btree_set<uint64_t>>(num_elements_start, num_ranges,
     //                                           max_log_range_size, 40, trials,
@@ -232,13 +292,19 @@ int main(int32_t argc, char *argv[]) {
     uint64_t num_elements_start = atoll(argv[2]);
     uint64_t num_ranges = atoll(argv[3]);
     uint64_t range_size = atoll(argv[4]);
+    if (num_ranges > std::numeric_limits<key_type>::max()) {
+      std::cout << "num_ranges is too big for the requested type\n";
+    }
+    if (range_size > std::numeric_limits<key_type>::max()) {
+      std::cout << "range_size is too big for the requested type\n";
+    }
 
     std::random_device r;
     std::seed_seq seed1{0};
     std::seed_seq seed2{1};
 
-    map_range_test<CPMA<traits>>(num_elements_start, num_ranges, range_size, 40,
-                                 seed1, seed2);
+    map_range_test<CPMA<traits>>(num_elements_start, (key_type)num_ranges,
+                                 (key_type)range_size, 40, seed1, seed2);
   }
 
   if (std::string("ycsb_a") == argv[1]) {
@@ -247,18 +313,22 @@ int main(int32_t argc, char *argv[]) {
     words W = stringToWords(S, length);
     printf("got %ld words\n", W.m);
     std::vector<bool> operations(W.m / 2);
-    std::vector<typename traits::key_type> values(W.m / 2);
+    std::vector<key_type> values(W.m / 2);
     uint64_t insert_count = 0;
     uint64_t read_count = 0;
     for (int64_t i = 0; i < W.m / 2; i++) {
       if (W.Strings[2 * i] == std::string("INSERT")) {
         insert_count += 1;
         operations[i] = true;
-        values[i] = atoll(W.Strings[2 * i + 1]);
+        assert((uint64_t)atoll(W.Strings[2 * i + 1]) <=
+               (uint64_t)std::numeric_limits<key_type>::max());
+        values[i] = (key_type)atoll(W.Strings[2 * i + 1]);
       } else if (W.Strings[2 * i] == std::string("READ")) {
         read_count += 1;
         operations[i] = false;
-        values[i] = atoll(W.Strings[2 * i + 1]);
+        assert((uint64_t)atoll(W.Strings[2 * i + 1]) <=
+               (uint64_t)std::numeric_limits<key_type>::max());
+        values[i] = (key_type)atoll(W.Strings[2 * i + 1]);
       } else {
         printf("something is wrong\n");
       }
@@ -275,19 +345,25 @@ int main(int32_t argc, char *argv[]) {
     char *S = readStringFromFile(argv[2], &length);
     words W = stringToWords(S, length);
     printf("got %ld words\n", W.m);
-    std::vector<typename traits::key_type> values(W.m / 3);
-    std::vector<typename traits::key_type> ranges(W.m / 3);
+    std::vector<key_type> values(W.m / 3);
+    std::vector<key_type> ranges(W.m / 3);
     uint64_t insert_count = 0;
     uint64_t scan_count = 0;
     for (int64_t i = 0; i < W.m / 3; i++) {
       if (W.Strings[3 * i] == std::string("INSERT")) {
         insert_count += 1;
         ranges[i] = 0;
-        values[i] = atoll(W.Strings[3 * i + 1]);
+        assert((uint64_t)atoll(W.Strings[3 * i + 1]) <=
+               (uint64_t)std::numeric_limits<key_type>::max());
+        values[i] = (key_type)atoll(W.Strings[3 * i + 1]);
       } else if (W.Strings[3 * i] == std::string("SCAN")) {
         scan_count += 1;
-        values[i] = atoll(W.Strings[3 * i + 1]);
-        ranges[i] = atoll(W.Strings[3 * i + 2]);
+        assert((uint64_t)atoll(W.Strings[3 * i + 1]) <=
+               (uint64_t)std::numeric_limits<key_type>::max());
+        values[i] = (key_type)atoll(W.Strings[3 * i + 1]);
+        assert((uint64_t)atoll(W.Strings[3 * i + 2]) <=
+               (uint64_t)std::numeric_limits<key_type>::max());
+        ranges[i] = (key_type)atoll(W.Strings[3 * i + 2]);
       } else {
         printf("something is wrong\n");
       }
@@ -297,6 +373,31 @@ int main(int32_t argc, char *argv[]) {
     ycsb_scan_bench<CPMA<traits>>(values, ranges);
     ycsb_scan_bench<tlx::btree_set<typename traits::key_type>>(values, ranges);
   }
+  /*
+  if constexpr (support_rank) {
+    if (std::string("simple_rank") == argv[1]) {
+      uint64_t num_elements = atoll(argv[2]);
+      simple_rank_test<CPMA<traits>>(num_elements);
+    }
+
+    if (std::string("batch_rank") == argv[1]) {
+      uint64_t num_elements = atoll(argv[2]);
+      uint64_t batch_size = atoll(argv[3]);
+      simple_rank_test<CPMA<traits>>(num_elements, batch_size);
+    }
+
+    if (std::string("rank_insert") == argv[1]) {
+      uint64_t num_elements = atoll(argv[2]);
+      simple_rank_insert_test<CPMA<traits>>(num_elements);
+    }
+
+    if (std::string("key_value") == argv[1]) {
+      uint64_t num_elements = atoll(argv[2]);
+      simple_key_value_test(num_elements);
+      simple_key_value_test_map(num_elements);
+    }
+  }
+  */
 
   if (std::string("batch_build") == argv[1]) {
     uint64_t size =
@@ -308,5 +409,10 @@ int main(int32_t argc, char *argv[]) {
     double seconds =
         build_by_batch_for_time<traits>(atoll(argv[2]), atoll(argv[3]), 5);
     std::cout << "mean time " << seconds << "\n";
+  }
+
+  if (std::string("batch_build_with_sum") == argv[1]) {
+    growing_factor_analysis_with_batches<traits>(atoll(argv[2]), atoll(argv[3]),
+                                                 atoll(argv[4]), argv[5]);
   }
 }

@@ -65,18 +65,6 @@ private:
   uint64_t state = 0;
 };
 
-// returns the log base 2 rounded up (works on ints or longs or unsigned
-// versions)
-template <class T> size_t log2_up(T i) {
-  size_t a = 0;
-  T b = i - 1;
-  while (b > 0) {
-    b = b >> 1U;
-    a++;
-  }
-  return a;
-}
-
 template <class intT> struct rMat {
   double a, ab, abc;
   intT n;

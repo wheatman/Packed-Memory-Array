@@ -1,9 +1,11 @@
 #pragma once
 #include "ParallelTools/parallel.h"
+#include "ParallelTools/reducer.h"
 #include "StructOfArrays/multipointer.hpp"
 #include "StructOfArrays/soa.hpp"
-#include "helpers.h"
+#include "helpers.hpp"
 #include "timers.hpp"
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cstddef>
@@ -16,7 +18,7 @@
 #include <tuple>
 #include <type_traits>
 
-#include "parlaylib/include/parlay/sequence.h"
+#include "parlay/sequence.h"
 
 /*
   Only works to store unique elements
@@ -95,8 +97,7 @@ public:
       return false;
     }
     T operator*() const { return curr_elem; }
-
-    void *get_pointer() const { return (void *)ptr; }
+    [[nodiscard]] void *get_pointer() const { return (void *)ptr; }
   };
   iterator begin() const { return iterator(head, array); }
   iterator_end end() const { return {}; }
@@ -422,6 +423,11 @@ private:
     memcpy(&pointer, data + 1, sizeof(T *));
     return pointer;
   }
+  static T get_first_element_out_of_place(T *data) {
+    T element;
+    memcpy(&element, get_out_of_place_pointer(data), sizeof(T));
+    return element;
+  }
   static void set_out_of_place_pointer(T *data, T *pointer) {
     memcpy(data + 1, &pointer, sizeof(T *));
   }
@@ -439,6 +445,11 @@ private:
 
   T *get_out_of_place_pointer() const {
     return get_out_of_place_pointer(T_array());
+  }
+  T get_first_element_out_of_place() const {
+    T element;
+    memcpy(&element, get_out_of_place_pointer(), sizeof(T));
+    return element;
   }
   void set_out_of_place_pointer(T *pointer) const {
     set_out_of_place_pointer(T_array(), pointer);
@@ -524,7 +535,8 @@ public:
   // Output: returns a tuple (ptr to where this merge stopped in the batch,
   // number of distinct elements merged in, and number of bytes used in this
   // leaf)
-  template <bool head_in_place>
+  template <bool head_in_place, bool parallel,
+            typename ValueUpdate = std::nullptr_t>
   std::tuple<element_ptr_type, uint64_t, uint64_t>
   merge_into_leaf(element_ptr_type batch_start_, T *batch_end,
                   uint64_t end_val) {
@@ -581,21 +593,87 @@ public:
       distinct_batch_elts++;
       temp_ptr += sizeof(T);
       batch_ptr++;
+      while (batch_ptr < batch_end && *batch_ptr == last_written) {
+        ++batch_ptr;
+      }
     } else { // copy over the old head
       *((T *)temp_ptr) = old_head;
       last_written = old_head;
       temp_ptr += sizeof(T);
     }
     // anything that needs go from the batch before the old head
-    while (batch_ptr < batch_end && batch_ptr[0] < old_head) {
-      T new_difference = *batch_ptr - last_written;
-      if (new_difference > 0) {
-        int64_t er_size = EncodeResult::write_encoded(new_difference, temp_ptr);
-        last_written = *batch_ptr;
-        distinct_batch_elts++;
-        temp_ptr += er_size;
+    bool did_before_head = false;
+    if constexpr (parallel && binary) {
+      if (temp_size > 100 && *batch_ptr < old_head) {
+        auto before_head_end = std::lower_bound(batch_ptr, batch_end, old_head);
+        size_t number_before_head = before_head_end - batch_ptr;
+        if (number_before_head > 1000) {
+          size_t num_blocks = std::min(number_before_head / 100,
+                                       (size_t)ParallelTools::getWorkers());
+          if (num_blocks > 1) {
+            std::vector<uint8_t *> blocks(num_blocks);
+            std::vector<uint64_t> block_sizes(num_blocks + 1);
+            std::vector<T *> block_ends(num_blocks + 1);
+            blocks[0] = temp_ptr;
+            block_ends[0] = batch_ptr;
+            block_ends[num_blocks] = before_head_end;
+            size_t per_block_count = number_before_head / num_blocks;
+            ParallelTools::Reducer_sum<size_t> elements_added;
+            for (size_t i = 1; i < num_blocks; i++) {
+              size_t block_size = temp_size / num_blocks;
+              block_size += max_element_size;
+              if (block_size % 32 != 0) {
+                block_size = (block_size / 32) * 32 + 32;
+              }
+              blocks[i] = (uint8_t *)aligned_alloc(32, block_size);
+              block_ends[i] = batch_ptr + per_block_count * i;
+            }
+            ParallelTools::parallel_for(0, num_blocks, [&](size_t j) {
+              // we know we can always look back one since we already past the
+              // head, and each other one goes into the block before it
+              uint8_t *block_temp_ptr = blocks[j];
+              for (T *block_ptr = block_ends[j]; block_ptr < block_ends[j + 1];
+                   block_ptr++) {
+                T new_difference = *block_ptr - *(block_ptr - 1);
+                if (new_difference > 0) {
+                  int64_t er_size = EncodeResult::write_encoded(new_difference,
+                                                                block_temp_ptr);
+                  block_temp_ptr += er_size;
+                  ++elements_added;
+                }
+              }
+              block_sizes[j + 1] = block_temp_ptr - blocks[j];
+            });
+            for (size_t i = 1; i < num_blocks; i++) {
+              block_sizes[i + 1] += block_sizes[i];
+            }
+            ParallelTools::parallel_for(1, num_blocks, [&](size_t j) {
+              memcpy(temp_ptr + block_sizes[j], blocks[j],
+                     block_sizes[j + 1] - block_sizes[j]);
+              free(blocks[j]);
+            });
+            batch_ptr += number_before_head - 1;
+            last_written = *batch_ptr;
+            ++batch_ptr;
+            temp_ptr += block_sizes[num_blocks];
+            distinct_batch_elts += elements_added;
+            did_before_head = true;
+          }
+        }
       }
-      batch_ptr++;
+    }
+    if (!did_before_head) {
+      while (batch_ptr < batch_end && batch_ptr[0] < old_head) {
+        T new_difference = *batch_ptr - last_written;
+        if (new_difference > 0) {
+          int64_t er_size =
+              EncodeResult::write_encoded(new_difference, temp_ptr);
+          last_written = *batch_ptr;
+          distinct_batch_elts++;
+          temp_ptr += er_size;
+        }
+        batch_ptr++;
+      }
     }
     // if we still need to copy the old leaf head
     if (leaf_ptr == array) {
@@ -608,60 +686,62 @@ public:
     }
 
     // deal with the rest of the elements
-    while (true) {
-      assert(leaf_ptr < leaf_end);
-      const DecodeResult dr(leaf_ptr);
-      // if duplicates in batch, skip
-      if (*batch_ptr == last_written) {
-        batch_ptr++;
-        // std::cout << "skipping duplicate\n";
-        if (batch_ptr == batch_end || *batch_ptr >= end_val) {
-          break;
-        }
-        continue;
-      }
-      const T leaf_element = last_in_leaf + dr.difference;
-
-      assert(leaf_element > last_written);
-      // otherwise, do a step of the merge
-
-      if (leaf_element <= *batch_ptr) {
-        int64_t er_size;
-        if (last_written != last_in_leaf) {
-          er_size = EncodeResult::write_encoded(leaf_element - last_written,
-                                                temp_ptr);
-        } else {
-          er_size = dr.old_size;
-          // small_memcpy(temp_ptr, leaf_ptr, dr.old_size);
-          // everything has a few extra bytes on the end, so copy a fixed size
-          // for simplicity and performance
-          memcpy(temp_ptr, leaf_ptr, max_element_size);
-        }
-        last_written = leaf_element;
-        assert(last_written < end_val);
-        last_in_leaf = leaf_element;
-        temp_ptr += er_size;
-        leaf_ptr += dr.old_size;
-        if (leaf_element == *batch_ptr) {
+    if (batch_ptr != batch_end && *batch_ptr < end_val) {
+      while (true) {
+        assert(leaf_ptr < leaf_end);
+        const DecodeResult dr(leaf_ptr);
+        // if duplicates in batch, skip
+        if (*batch_ptr == last_written) {
           batch_ptr++;
+          // std::cout << "skipping duplicate\n";
           if (batch_ptr == batch_end || *batch_ptr >= end_val) {
             break;
           }
+          continue;
         }
-        if (*leaf_ptr == 0) {
-          break;
-        }
-        assert(temp_ptr < temp_arr + temp_size);
-      } else { // if (leaf_element > *batch_ptr) {
-        int64_t er_size =
-            EncodeResult::write_encoded(*batch_ptr - last_written, temp_ptr);
-        last_written = *batch_ptr;
-        assert(last_written < end_val);
-        batch_ptr++;
-        distinct_batch_elts++;
-        temp_ptr += er_size;
-        if (batch_ptr == batch_end || *batch_ptr >= end_val) {
-          break;
+        const T leaf_element = last_in_leaf + dr.difference;
+
+        assert(leaf_element > last_written);
+        // otherwise, do a step of the merge
+
+        if (leaf_element <= *batch_ptr) {
+          int64_t er_size;
+          if (last_written != last_in_leaf) {
+            er_size = EncodeResult::write_encoded(leaf_element - last_written,
+                                                  temp_ptr);
+          } else {
+            er_size = dr.old_size;
+            // small_memcpy(temp_ptr, leaf_ptr, dr.old_size);
+            // everything has a few extra bytes on the end, so copy a fixed size
+            // for simplicity and performance
+            memcpy(temp_ptr, leaf_ptr, max_element_size);
+          }
+          last_written = leaf_element;
+          assert(last_written < end_val);
+          last_in_leaf = leaf_element;
+          temp_ptr += er_size;
+          leaf_ptr += dr.old_size;
+          if (leaf_element == *batch_ptr) {
+            batch_ptr++;
+            if (batch_ptr == batch_end || *batch_ptr >= end_val) {
+              break;
+            }
+          }
+          if (*leaf_ptr == 0) {
+            break;
+          }
+          assert(temp_ptr < temp_arr + temp_size);
+        } else { // if (leaf_element > *batch_ptr) {
+          int64_t er_size =
+              EncodeResult::write_encoded(*batch_ptr - last_written, temp_ptr);
+          last_written = *batch_ptr;
+          assert(last_written < end_val);
+          batch_ptr++;
+          distinct_batch_elts++;
+          temp_ptr += er_size;
+          if (batch_ptr == batch_end || *batch_ptr >= end_val) {
+            break;
+          }
         }
       }
     }
@@ -902,7 +982,10 @@ public:
           // its empty, but we may as well put a valid pointer here
           leaf_start[i] = nullptr;
         } else {
-          index_to_head(leaf_start_index + i) = *l.get_out_of_place_pointer();
+          std::get<0>(index_to_head(leaf_start_index + i)) =
+              l.get_first_element_out_of_place();
+          assert(l.get_first_element_out_of_place() != 0);
+          assert(std::get<0>(index_to_head(leaf_start_index + i)) != 0);
           leaf_start[i] = l.get_out_of_place_pointer() + 1;
         }
       } else {
@@ -919,28 +1002,30 @@ public:
       }
     }
 
-    ParallelTools::parallel_for(start_leaf + 1, num_leaves, [&](uint64_t i) {
-      T leaf_head = std::get<0>(index_to_head(leaf_start_index + i));
-      if (leaf_head != 0) {
-        T last = last_per_leaf[i - 1];
-        if (last == 0) {
-          if (i >= 2) {
-            uint64_t j = i - 2;
-            while (j < i) {
-              last = last_per_leaf[j];
-              if (last) {
-                break;
+    if (start_leaf < std::numeric_limits<uint64_t>::max()) {
+      ParallelTools::parallel_for(start_leaf + 1, num_leaves, [&](uint64_t i) {
+        T leaf_head = std::get<0>(index_to_head(leaf_start_index + i));
+        if (leaf_head != 0) {
+          T last = last_per_leaf[i - 1];
+          if (last == 0) {
+            if (i >= 2) {
+              uint64_t j = i - 2;
+              while (j < i) {
+                last = last_per_leaf[j];
+                if (last) {
+                  break;
+                }
+                j -= 1;
               }
-              j -= 1;
             }
           }
+          T difference = leaf_head - last;
+          assert(difference < leaf_head);
+          index_to_head(leaf_start_index + i) = difference;
+          bytes_per_leaf[i] += EncodeResult(difference).size;
         }
-        T difference = leaf_head - last;
-        assert(difference < leaf_head);
-        index_to_head(leaf_start_index + i) = difference;
-        bytes_per_leaf[i] += EncodeResult(difference).size;
-      }
-    });
+      });
+    }
 
     uint64_t total_size;
 #if PARALLEL == 0
@@ -963,7 +1048,8 @@ public:
     if (start_leaf < std::numeric_limits<uint64_t>::max()) {
       uint64_t i = start_leaf;
       *(reinterpret_cast<T *>(merged_arr) - 1) =
-          std::get<0>(index_to_head(leaf_start_index));
+          std::get<0>(index_to_head(leaf_start_index + start_leaf));
+      assert(std::get<0>(index_to_head(leaf_start_index + start_leaf)) != 0);
       memcpy(merged_arr, leaf_start[i], bytes_per_leaf[start_leaf]);
       if (leaf_start[i] !=
           start + i * leaf_size / sizeof(T) + ((head_in_place) ? 1 : 0)) {
@@ -990,17 +1076,20 @@ public:
         }
       }
     });
+    // TODO(wheatman) parallel for
     for (uint64_t i = total_size; i < memory_size - sizeof(T); i++) {
       merged_arr[i] = 0;
     }
 
     delta_compressed_leaf result(*(reinterpret_cast<T *>(merged_arr) - 1),
                                  (void *)merged_arr, memory_size);
+
+    assert(result.head != 0 || (result.head == 0 && total_size == 0));
     //+sizeof(T) to include the head
     return {result, total_size + sizeof(T)};
   }
 
-  template <bool head_in_place, bool have_densities, typename F,
+  template <bool head_in_place, bool have_densities, bool parallel, typename F,
             typename density_array_type>
   static merged_data merge(element_ptr_type start_, uint64_t num_leaves,
                            uint64_t leaf_size, uint64_t leaf_start_index,
@@ -1008,13 +1097,13 @@ public:
                            [[maybe_unused]] density_array_type density_array) {
     T *start = start_.get_pointer();
 
-#if PARALLEL == 1
-    if (num_leaves > ParallelTools::getWorkers() * 100U) {
-      return parallel_merge<head_in_place, have_densities>(
-          start, num_leaves, leaf_size, leaf_start_index, index_to_head,
-          density_array);
+    if constexpr (parallel) {
+      if (num_leaves > ParallelTools::getWorkers() * 100U) {
+        return parallel_merge<head_in_place, have_densities>(
+            start, num_leaves, leaf_size, leaf_start_index, index_to_head,
+            density_array);
+      }
     }
-#endif
     uint64_t dest_size = (max_element_size - sizeof(T)) * num_leaves;
     for (uint64_t i = 0; i < num_leaves; i++) {
       uint64_t src_idx = i * (leaf_size / sizeof(T));
@@ -1125,7 +1214,8 @@ public:
         }
       } else if (get_out_of_place_used_bytes(leaf_start_array_pointer) != 0) {
         T *extrenal_leaf = get_out_of_place_pointer(leaf_start_array_pointer);
-        T external_leaf_head = *extrenal_leaf;
+        T external_leaf_head =
+            get_first_element_out_of_place(leaf_start_array_pointer);
         EncodeResult er(external_leaf_head - prev_elt);
         small_memcpy(dest_byte_position, er.data, er.size);
         dest_byte_position += er.size;
@@ -1148,10 +1238,12 @@ public:
     delta_compressed_leaf result(merged_arr[0], (void *)(merged_arr + 1),
                                  memory_size - sizeof(T));
 
-    // comment back in to debug, also need to comment out the freeing of extra
-    // space
-    // if (num_leaves >= 2) {
-    //   auto parallel_check = parallel_merge<head_in_place, have_densities>(
+    assert((result.head != 0 || (result.head == 0 && num_full_bytes == 0)));
+
+    // comment back in to debug, also need to comment out the freeing of
+    // extra space if (num_leaves >= 2) {
+    //   auto parallel_check = parallel_merge<head_in_place,
+    //   have_densities>(
     //       start - head_in_place, num_leaves, leaf_size, leaf_start_index,
     //       index_to_head, density_array);
     //   if (num_full_bytes != parallel_check.second) {
@@ -1186,13 +1278,16 @@ public:
   // you have num_leaves * num_bytes bytes available here to write to)
   // output: split input leaf into num_leaves leaves, each with
   // num_output_bytes bytes
-  template <bool head_in_place, bool store_densities, typename F,
-            typename density_array_type>
+  template <bool head_in_place, bool store_densities, bool support_rank,
+            typename F, typename density_array_type,
+            typename rank_tree_array_type>
   void parallel_split(const uint64_t num_leaves,
                       const uint64_t num_occupied_bytes,
                       const uint64_t bytes_per_leaf, T *dest_region,
                       uint64_t leaf_start_index, F index_to_head,
-                      density_array_type density_array) {
+                      density_array_type density_array,
+                      [[maybe_unused]] rank_tree_array_type rank_tree_array,
+                      [[maybe_unused]] uint64_t total_leaves) {
     std::vector<uint8_t *> start_points(num_leaves + 1);
     start_points[0] = array;
     // - sizeof(T) is becuase num_occupied_bytes counts the head, but its not in
@@ -1220,6 +1315,9 @@ public:
     });
     std::vector<T> difference_accross_leaf(num_leaves);
     std::vector<uint64_t> running_element_count;
+    if constexpr (support_rank) {
+      running_element_count.resize(num_leaves);
+    }
     // first loop not in parallel due to weird compiler behavior
     {
       uint64_t i = 0;
@@ -1250,9 +1348,13 @@ public:
       delta_compressed_leaf<T> l(index_to_head(leaf_start_index + i), dest,
                                  bytes_per_leaf -
                                      ((head_in_place) ? sizeof(T) : 0));
-
-      difference_accross_leaf[i] = l.last();
-
+      if constexpr (support_rank) {
+        auto [leaf_last, leaf_count] = l.last_and_count();
+        difference_accross_leaf[i] = leaf_last;
+        running_element_count[i] = leaf_count;
+      } else {
+        difference_accross_leaf[i] = l.last();
+      }
       assert(difference_accross_leaf[i] != 0);
     }
 
@@ -1291,9 +1393,13 @@ public:
                                  bytes_per_leaf -
                                      ((head_in_place) ? sizeof(T) : 0));
       // l.print();
-
-      difference_accross_leaf[i] = l.last();
-
+      if constexpr (support_rank) {
+        auto [leaf_last, leaf_count] = l.last_and_count();
+        difference_accross_leaf[i] = leaf_last;
+        running_element_count[i] = leaf_count;
+      } else {
+        difference_accross_leaf[i] = l.last();
+      }
       assert(difference_accross_leaf[i] != 0);
     });
 
@@ -1306,7 +1412,58 @@ public:
       prefix_sum_inclusive(difference_accross_leaf);
     }
 #endif
-
+    if constexpr (support_rank) {
+#if PARALLEL == 0
+      prefix_sum_inclusive(running_element_count);
+#else
+      if (num_leaves > 1 << 15) {
+        parlay::scan_inclusive_inplace(running_element_count);
+      } else {
+        prefix_sum_inclusive(running_element_count);
+      }
+#endif
+      ParallelTools::parallel_for(0, num_leaves, [&](uint64_t i) {
+        if (i < nextPowerOf2(total_leaves) - 1 &&
+            i < nextPowerOf2(num_leaves) - 1) {
+          uint64_t running_element_total = running_element_count[i];
+          uint64_t my_e_index = e_index(leaf_start_index + i, total_leaves - 1);
+          uint64_t parent_i_plus_1 = (i + 1) & i;
+          uint64_t parent_running_element_total = 0;
+          if (parent_i_plus_1 > 0) {
+            parent_running_element_total =
+                running_element_count[parent_i_plus_1 - 1];
+          }
+          rank_tree_array[my_e_index] =
+              running_element_total - parent_running_element_total;
+        }
+      });
+      ParallelTools::parallel_for(
+          num_leaves,
+          std::min(nextPowerOf2(num_leaves) - 1, nextPowerOf2(total_leaves)),
+          [&](uint64_t i) {
+            uint64_t running_element_total =
+                running_element_count[num_leaves - 1];
+            uint64_t my_e_index =
+                e_index(leaf_start_index + i, total_leaves - 1);
+            uint64_t parent_i_plus_1 = (i + 1) & i;
+            uint64_t parent_running_element_total = 0;
+            if (parent_i_plus_1 > 0) {
+              if (parent_i_plus_1 <= running_element_count.size()) {
+                parent_running_element_total =
+                    running_element_count[parent_i_plus_1 - 1];
+              } else {
+                parent_running_element_total =
+                    running_element_count[num_leaves - 1];
+              }
+            }
+            if (parent_running_element_total > running_element_total) {
+              rank_tree_array[my_e_index] = 0;
+            } else {
+              rank_tree_array[my_e_index] =
+                  running_element_total - parent_running_element_total;
+            }
+          });
+    }
     ParallelTools::parallel_for(1, num_leaves, [&](uint64_t i) {
       std::get<0>(index_to_head(leaf_start_index + i)) +=
           difference_accross_leaf[i - 1];
@@ -1314,12 +1471,15 @@ public:
     });
   }
 
-  template <bool head_in_place, bool store_densities, typename F,
-            typename density_array_type>
+  template <bool head_in_place, bool store_densities, bool support_rank,
+            bool parallel, typename F, typename density_array_type,
+            typename rank_tree_array_type>
   void split(const uint64_t num_leaves, const uint64_t num_occupied_bytes,
              const uint64_t bytes_per_leaf, element_ptr_type dest_region_,
              uint64_t leaf_start_index, F index_to_head,
-             density_array_type density_array) {
+             density_array_type density_array,
+             [[maybe_unused]] rank_tree_array_type rank_tree_array,
+             [[maybe_unused]] uint64_t total_leaves) {
     ASSERT(used_size_simple<head_in_place>() ==
                num_occupied_bytes - ((head_in_place) ? 0 : sizeof(T)),
            "used_size_simple() == %lu, num_occupied_bytes - ((head_in_place) ? "
@@ -1348,13 +1508,14 @@ public:
                  ((head_in_place) ? sizeof(T) : 0));
       return;
     }
-#if PARALLEL == 1
-    if (num_leaves > ParallelTools::getWorkers() * 100U) {
-      return parallel_split<head_in_place, store_densities>(
-          num_leaves, num_occupied_bytes, bytes_per_leaf, dest_region,
-          leaf_start_index, index_to_head, density_array);
+    if constexpr (parallel) {
+      if (num_leaves > ParallelTools::getWorkers() * 100U) {
+        return parallel_split<head_in_place, store_densities, support_rank>(
+            num_leaves, num_occupied_bytes, bytes_per_leaf, dest_region,
+            leaf_start_index, index_to_head, density_array, rank_tree_array,
+            total_leaves);
+      }
     }
-#endif
     if constexpr (head_in_place) {
       dest_region += 1;
     }
@@ -1367,6 +1528,8 @@ public:
     index_to_head(leaf_start_index) = head;
     uint64_t bytes_read = sizeof(T);
     // do intermediate leaves with heads
+    uint64_t running_element_total = 1;
+    uint64_t min_e_index_found = std::numeric_limits<uint64_t>::max();
     for (uint64_t leaf_idx = 0; leaf_idx < num_leaves - 1; leaf_idx++) {
       uint64_t bytes_for_leaf =
           (num_occupied_bytes - bytes_read) / (num_leaves - leaf_idx);
@@ -1381,6 +1544,9 @@ public:
         index_to_head(leaf_start_index + leaf_idx) = cur_elt;
         assert(cur_elt > 0);
         bytes_read += dr.old_size;
+        if constexpr (support_rank) {
+          running_element_total += 1;
+        }
       }
       uint64_t bytes_so_far = 0;
       uint8_t *leaf_start = src; // start of differences in this leaf from src
@@ -1395,6 +1561,9 @@ public:
         bytes_so_far += dr.old_size;
         cur_elt += dr.difference;
         bytes_read += dr.old_size;
+        if constexpr (support_rank) {
+          running_element_total += 1;
+        }
       }
 
       uint64_t num_bytes_filled = src - leaf_start;
@@ -1411,6 +1580,19 @@ public:
           if (std::get<0>(index_to_head(leaf_start_index + leaf_idx)) != 0) {
             density_array[leaf_start_index + leaf_idx] += sizeof(T);
           }
+        }
+      }
+      if constexpr (support_rank) {
+        if (leaf_idx < nextPowerOf2(total_leaves) - 1 &&
+            leaf_idx < nextPowerOf2(num_leaves) - 1) {
+          uint64_t my_e_index =
+              e_index(leaf_start_index + leaf_idx, total_leaves - 1);
+          rank_tree_array[my_e_index] =
+              running_element_total - rank_tree_array_get_prior_in_range(
+                                          leaf_start_index + leaf_idx,
+                                          total_leaves - 1, min_e_index_found,
+                                          rank_tree_array);
+          min_e_index_found = std::min(min_e_index_found, my_e_index);
         }
       }
       memset(dest + num_bytes_filled, 0,
@@ -1451,12 +1633,41 @@ public:
 
     memset(dest + leftover_bytes, 0,
            bytes_per_leaf - leftover_bytes - ((head_in_place) ? sizeof(T) : 0));
+
+    if constexpr (support_rank) {
+      if (num_leaves - 1 < nextPowerOf2(total_leaves) - 1 &&
+          num_leaves - 1 < nextPowerOf2(num_leaves) - 1) {
+        delta_compressed_leaf<T> l(
+            std::get<0>(index_to_head(leaf_start_index + num_leaves - 1)), dest,
+            bytes_per_leaf - ((head_in_place) ? sizeof(T) : 0));
+        running_element_total += l.element_count();
+        uint64_t my_e_index =
+            e_index(leaf_start_index + num_leaves - 1, total_leaves - 1);
+        rank_tree_array[my_e_index] =
+            running_element_total - rank_tree_array_get_prior_in_range(
+                                        leaf_start_index + num_leaves - 1,
+                                        total_leaves - 1, min_e_index_found,
+                                        rank_tree_array);
+        min_e_index_found = std::min(min_e_index_found, my_e_index);
+      }
+
+      for (uint64_t i = num_leaves; i < nextPowerOf2(num_leaves) - 1 &&
+                                    i < nextPowerOf2(total_leaves) - 1;
+           i++) {
+        uint64_t my_e_index = e_index(leaf_start_index + i, total_leaves - 1);
+        rank_tree_array[my_e_index] =
+            running_element_total - rank_tree_array_get_prior_in_range(
+                                        leaf_start_index + i, total_leaves - 1,
+                                        min_e_index_found, rank_tree_array);
+        min_e_index_found = std::min(min_e_index_found, my_e_index);
+      }
+    }
   }
 
   // inserts an element
   // first return value indicates if something was inserted
   // if something was inserted the second value tells you the current size
-  template <bool head_in_place>
+  template <bool head_in_place, typename ValueUpdate = std::nullptr_t>
   std::pair<bool, size_t> insert(element_type x_) {
     key_type x = std::get<0>(x_);
     if constexpr (head_in_place) {
@@ -1513,6 +1724,13 @@ public:
     small_memcpy(array + fr.loc + er.size, new_er.data, new_er.size);
     return {true, used_size_with_start<head_in_place>(fr.loc + er.size +
                                                       new_er.size)};
+  }
+
+  template <bool head_in_place>
+  std::pair<bool, size_t> insert_by_rank([[maybe_unused]] T x,
+                                         [[maybe_unused]] uint64_t rank) {
+    std::cerr << "TODO implement insert_by_rank in compressed leaf\n";
+    return {false, 0};
   }
 
   // removes an element
@@ -1762,7 +1980,7 @@ public:
   //   return res;
   // }
 
-  uint64_t element_count() const {
+  [[nodiscard]] uint64_t element_count() const {
     T curr_elem = 0;
     int64_t curr_loc = 0;
     uint64_t count = 0;
@@ -2002,6 +2220,54 @@ public:
     return used_size_simple_with_start<head_in_place>(start);
   }
 
+  uint64_t rank(T e) const {
+    if (e <= head) {
+      return 0;
+    } else {
+      uint64_t count = 0;
+
+      T curr_elem = 0;
+      int64_t curr_loc = 0;
+      DecodeResult dr(head, 0);
+      while (dr.difference != 0) {
+        curr_elem += dr.difference;
+        if (curr_elem >= e) {
+          break;
+        }
+        count += 1;
+        curr_loc += dr.old_size;
+        dr = DecodeResult(array + curr_loc);
+      }
+      return count;
+    }
+  }
+
+  T select(uint64_t rank) const {
+    if (rank == 0) {
+      return head;
+    }
+    // something happened so we don't know the exact rank, but we should go to
+    // the end
+    if (rank >= static_cast<uint64_t>(length_in_bytes)) {
+      return last();
+    }
+    uint64_t count = 0;
+
+    T curr_elem = 0;
+    int64_t curr_loc = 0;
+    DecodeResult dr(head, 0);
+    while (dr.difference != 0) {
+      curr_elem += dr.difference;
+      if (count == rank) {
+        break;
+      }
+      count += 1;
+      curr_loc += dr.old_size;
+      dr = DecodeResult(array + curr_loc);
+    }
+    return curr_elem;
+  }
+
   iterator lower_bound(key_type key) {
     auto it = begin();
     for (; it != end(); ++it) {
@@ -2095,6 +2361,10 @@ public:
       typename std::conditional<binary, std::tuple<key_type &>,
                                 std::tuple<key_type &, VTs &...>>::type;
 
+  using element_const_ref_type = typename std::conditional<
+      binary, std::tuple<const key_type &>,
+      std::tuple<const key_type &, const VTs &...>>::type;
+
   using element_ptr_type =
       typename std::conditional<binary, MultiPointer<key_type>,
                                 MultiPointer<key_type, VTs...>>::type;
@@ -2108,45 +2378,56 @@ public:
   T head_key() const { return std::get<0>(head); }
   element_ptr_type array;
 
+  static constexpr std::array<uint8_t, SOA_type::get_size_static(1)>
+      zero_element_spot = {};
+
+  element_ptr_type zero_element_ptr() const {
+    return SOA_type::get_static_ptr((void *)zero_element_spot.data(), 1, 0);
+  }
+
   // just for an optimized compare to end
   class iterator_end {};
 
   // to scan over the data when it is in valid state
   // does not deal with out of place data
   class iterator {
-    element_type curr_elem;
+    element_ptr_type curr_elem_ptr;
     element_ptr_type ptr;
 
   public:
-    iterator(element_type head_, element_ptr_type p)
-        : curr_elem(head_), ptr(p) {}
+    iterator(element_ref_type head_, element_ptr_type p)
+        : curr_elem_ptr(head_), ptr(p) {}
+    iterator(element_ptr_type head_, element_ptr_type p)
+        : curr_elem_ptr(head_), ptr(p) {}
     // only for use comparing to end
     bool operator!=([[maybe_unused]] const iterator_end &end) const {
-      return std::get<0>(curr_elem) != 0;
+      return std::get<0>(*curr_elem_ptr) != 0;
     }
     bool operator==([[maybe_unused]] const iterator_end &end) const {
-      return std::get<0>(curr_elem) == 0;
+      return std::get<0>(*curr_elem_ptr) == 0;
     }
 
     iterator &operator++() {
-      curr_elem = *ptr;
+      curr_elem_ptr = ptr;
       ptr = ptr + 1;
       return *this;
     }
     bool inc_and_check_end() {
-      curr_elem = *ptr;
+      curr_elem_ptr = ptr;
       ptr = ptr + 1;
-      return std::get<0>(curr_elem) == 0;
+      return curr_elem_ptr.template get<0>() == 0;
     }
     auto operator*() const {
       if constexpr (binary) {
-        return std::get<0>(curr_elem);
+        return (const key_type &)curr_elem_ptr.template get<0>();
       } else {
-        return curr_elem;
+        return (element_const_ref_type)*curr_elem_ptr;
       }
     }
 
-    void *get_pointer() const { return (void *)ptr.get_pointer(); }
+    [[nodiscard]] void *get_pointer() const {
+      return (void *)ptr.get_pointer();
+    }
   };
   iterator begin() const { return iterator(head, array); }
   iterator_end end() const { return {}; }
@@ -2183,8 +2464,7 @@ private:
   static void set_out_of_place_used_elements(T *data, uint64_t bytes) {
     // not theoretically true, but practially means something is wrong
     ASSERT(bytes < 0x1000000000000UL, "bytes = %lu\n", bytes);
-    uint64_t *long_ptr = (uint64_t *)data;
-    memcpy(long_ptr, &bytes, sizeof(uint64_t));
+    memcpy(data, &bytes, sizeof(uint64_t));
   }
 
   static void *get_out_of_place_pointer(T *data) {
@@ -2245,15 +2525,51 @@ public:
                     uint64_t length)
       : head(head_), array(array_), length_in_elements(length / sizeof(T)) {}
 
+  uint64_t rank(T e) const {
+    if (e <= head) {
+      return 0;
+    } else {
+      for (uint64_t i = 0; i < length_in_elements; i++) {
+        if (array[i] == 0 || array[i] >= e) {
+          return i + 1;
+        }
+      }
+      return length_in_elements + 1;
+    }
+  }
+
+  // returns the element with rank
+  // if rank is greater than the number of elements return the last element
+  T select(uint64_t rank) const {
+    if (rank == 0) {
+      return head;
+    }
+    // since we are no longer considering the head
+    rank -= 1;
+    // something happened so we don't know the exact rank, but we should go to
+    // the end
+    if (rank >= length_in_elements || array[rank] == 0) {
+      return last();
+    }
+    return array[rank];
+  }
+
   // Input: pointer to the start of this merge in the batch, end of batch,
   // value in the PMA at the next head (so we know when to stop merging)
   // Output: returns a tuple (ptr to where this merge stopped in the batch,
   // number of distinct elements merged in, and number of bytes used in this
   // leaf)
-  template <bool head_in_place>
+  template <bool head_in_place, bool parallel,
+            typename ValueUpdate = std::nullptr_t>
   std::tuple<element_ptr_type, uint64_t, uint64_t>
-  merge_into_leaf(element_ptr_type batch_start, T *batch_end,
-                  uint64_t end_val) {
+  merge_into_leaf(element_ptr_type batch_start, T *batch_end, uint64_t end_val,
+                  ValueUpdate value_update = {}) {
+
+    static_assert(
+        binary ||
+            std::is_invocable_v<ValueUpdate, element_ref_type, element_type>,
+        "the value update function must take in a reference to the "
+        "current value and the new value");
 #if DEBUG == 1
     if (!check_increasing_or_zero()) {
       print();
@@ -2266,7 +2582,8 @@ public:
     // case 1: only one element from the batch goes into the leaf
     if (batch_start.get_pointer() + 1 == batch_end ||
         batch_start.template get<0>(1) >= end_val) {
-      auto [inserted, byte_count] = insert<head_in_place>(*batch_start);
+      auto [inserted, byte_count] =
+          insert<head_in_place, ValueUpdate>(*batch_start);
 
       return {batch_start + 1, inserted, byte_count};
     }
@@ -2291,22 +2608,98 @@ public:
 
     uint64_t distinct_batch_elts = 0;
     T *leaf_end = array.get_pointer() + length_in_elements;
-    element_type last_written = element_type();
+    key_type last_written = key_type();
 
     // merge into temp space
     // everything that needs to go before the head
-    while (batch_ptr.get_pointer() < batch_end &&
-           batch_ptr.get() < head_key()) {
-      // if duplicates in batch, skip
-      if (batch_ptr.get() == std::get<0>(last_written)) {
-        batch_ptr = batch_ptr + 1;
-        continue;
+    bool did_before_head = false;
+    if constexpr (parallel && binary) {
+      if (temp_size > 100) {
+        auto before_head_end =
+            std::lower_bound(batch_ptr.get_pointer(), batch_end, head_key());
+        size_t number_before_head = before_head_end - batch_ptr.get_pointer();
+        size_t num_blocks = std::min(number_before_head / 100,
+                                     (size_t)ParallelTools::getWorkers());
+        // TODO(wheatman) deal with duplicates in the batch
+        if (num_blocks > 1) {
+          std::vector<uint64_t> block_sizes(num_blocks + 1);
+          size_t per_block_count = number_before_head / num_blocks;
+          ParallelTools::parallel_for(0, num_blocks, [&](size_t j) {
+            auto start = batch_ptr + per_block_count * j;
+            auto end = batch_ptr + per_block_count * (j + 1);
+            if (end > before_head_end || j == num_blocks - 1) {
+              end = before_head_end;
+            }
+            if (j == 0) {
+              ++start;
+              block_sizes[j + 1]++;
+            }
+            while (start < end) {
+              if (start.get(0) != (start - 1).get(0)) {
+                block_sizes[j + 1]++;
+              }
+              ++start;
+            }
+          });
+          for (size_t i = 1; i < num_blocks; i++) {
+            block_sizes[i + 1] += block_sizes[i];
+          }
+          number_before_head = block_sizes[num_blocks];
+          assert(number_before_head <= temp_size);
+          ParallelTools::parallel_for(0, num_blocks, [&](size_t j) {
+            auto start = batch_ptr + per_block_count * j;
+            auto end = batch_ptr + per_block_count * (j + 1);
+            if (end > before_head_end || j == num_blocks - 1) {
+              end = before_head_end;
+            }
+            size_t i = 0;
+            if (j == 0) {
+              temp_ptr[0] = *start;
+              ++start;
+              i++;
+            }
+            while (start < end) {
+              if (start.get(0) != (start - 1).get(0)) {
+                if (j == 0) {
+                  assert(i < (block_sizes[j + 1]));
+                } else {
+                  assert(i < (block_sizes[j + 1] - block_sizes[j]));
+                }
+                temp_ptr[block_sizes[j] + i] = *start;
+                i++;
+              }
+              ++start;
+            }
+          });
+          number_before_head = block_sizes[num_blocks];
+          batch_ptr += number_before_head;
+          temp_ptr += number_before_head - 1;
+          last_written = temp_ptr.get();
+          ++temp_ptr;
+          distinct_batch_elts += number_before_head;
+          did_before_head = true;
+        }
       }
-      *temp_ptr = *batch_ptr;
-      ++batch_ptr;
-      distinct_batch_elts++;
-      last_written = *temp_ptr;
-      ++temp_ptr;
+    }
+    if (!did_before_head) {
+      while (batch_ptr.get_pointer() < batch_end &&
+             batch_ptr.get() < head_key()) {
+        // if duplicates in batch, skip
+        // zeros are handled someplace else
+        assert(batch_ptr.get() != 0);
+        if (batch_ptr.get() == last_written) {
+          if constexpr (!binary) {
+            value_update((temp_ptr - 1)[0], batch_ptr[0]);
+          }
+          batch_ptr = batch_ptr + 1;
+          continue;
+        }
+        *temp_ptr = *batch_ptr;
+        ++batch_ptr;
+        distinct_batch_elts++;
+        last_written = temp_ptr.get();
+        ++temp_ptr;
+      }
     }
 
     if constexpr (!binary) {
@@ -2314,31 +2707,34 @@ public:
       // the head
       if (batch_ptr.get_pointer() < batch_end &&
           batch_ptr.get() == head_key()) {
-        head = *batch_ptr;
+        value_update(head, batch_ptr[0]);
         ++batch_ptr;
       }
     }
 
     // deal with the head
     temp_ptr[0] = head;
-    last_written = head;
+    last_written = std::get<0>(head);
     ++temp_ptr;
 
     // the standard merge
     while (batch_ptr.get_pointer() < batch_end && batch_ptr.get() < end_val &&
            leaf_ptr.get_pointer() < leaf_end && leaf_ptr.get() > 0) {
       // if duplicates in batch, skip
-      // if we are given the same key with a different value just arbitairly
-      // take the first
-      if (batch_ptr.get() == std::get<0>(last_written)) {
+      if (batch_ptr.get() == last_written) {
+        if constexpr (!binary) {
+          value_update((temp_ptr - 1)[0], batch_ptr[0]);
+        }
         ++batch_ptr;
         continue;
       }
 
       // otherwise, do a step of the merge
       if (std::get<0>(leaf_ptr[0]) == std::get<0>(batch_ptr[0])) {
-        // if the key was already there, take the element from the batch
-        *temp_ptr = *batch_ptr;
+        // if the key was already there first take the element that was already
+        // there, then merge in the new element from the batch
+        *temp_ptr = *leaf_ptr;
+        value_update(*temp_ptr, *batch_ptr);
         ++leaf_ptr;
         ++batch_ptr;
       } else if (std::get<0>(leaf_ptr[0]) > std::get<0>(batch_ptr[0])) {
@@ -2350,13 +2746,16 @@ public:
         ++leaf_ptr;
       }
 
-      last_written = *temp_ptr;
+      last_written = temp_ptr.get();
       ++temp_ptr;
     }
 
     // write rest of the batch if it exists
     while (batch_ptr.get_pointer() < batch_end && batch_ptr.get() < end_val) {
-      if (std::get<0>(batch_ptr[0]) == std::get<0>(last_written)) {
+      if (std::get<0>(batch_ptr[0]) == last_written) {
+        if constexpr (!binary) {
+          value_update((temp_ptr - 1)[0], batch_ptr[0]);
+        }
         ++batch_ptr;
         continue;
       }
@@ -2364,7 +2763,7 @@ public:
       ++batch_ptr;
       distinct_batch_elts++;
 
-      last_written = *temp_ptr;
+      last_written = temp_ptr.get();
       ++temp_ptr;
     }
     // write rest of the leaf it exists
@@ -2384,7 +2783,8 @@ public:
       free(temp_arr);
     } else {                 // special write for when you don't fit
       head = element_type(); // special case head
-      set_out_of_place_used_elements(used_elts);
+      assert(used_elts < (uint64_t)std::numeric_limits<T>::max());
+      set_out_of_place_used_elements((T)used_elts);
       set_out_of_place_pointer(temp_arr);
       set_out_of_place_soa_size(temp_size);
     }
@@ -2478,6 +2878,10 @@ public:
 
     // clear the rest of the space
     while (back_pointer.get_pointer() < front_pointer.get_pointer()) {
+      if constexpr (!binary) {
+        // the key needs to be a simple type that this is not needed for
+        back_pointer.zero();
+      }
       *back_pointer = element_type();
       ++back_pointer;
     }
@@ -2543,20 +2947,32 @@ public:
         for (uint64_t j = 0;
              j < get_out_of_place_used_elements(leaf_data_start.get_pointer());
              j++) {
+          if constexpr (!binary) {
+            (merged_mp + start + j).zero();
+          }
           merged_mp[start + j] = ptr_to_temp[j];
         }
         start += get_out_of_place_used_elements(leaf_data_start.get_pointer());
       } else { // otherwise, reading regular leaf
+        if constexpr (!binary) {
+          (merged_mp + start).zero();
+        }
         merged_mp[start] = index_to_head(leaf_start_index + i);
         start += (std::get<0>(index_to_head(leaf_start_index + i)) != 0);
         uint64_t local_start = start;
         if constexpr (head_in_place) {
           for (uint64_t j = 0; j < leaf_size - 1; j++) {
+            if constexpr (!binary) {
+              (merged_mp + local_start + j).zero();
+            }
             merged_mp[local_start + j] = array[j + src_idx + 1];
             start += (array.get(j + src_idx + 1) != 0);
           }
         } else {
           for (uint64_t j = 0; j < leaf_size; j++) {
+            if constexpr (!binary) {
+              (merged_mp + local_start + j).zero();
+            }
             merged_mp[local_start + j] = array[j + src_idx];
             start += (array.get(j + src_idx) != 0);
           }
@@ -2566,6 +2982,10 @@ public:
 
     // fill in the rest of the leaf with 0
     for (uint64_t i = start; i < memory_size; i++) {
+      if constexpr (!binary) {
+        // the key needs to be a simple type that this is not needed for
+        (merged_mp + i).zero();
+      }
       merged_mp[i] = element_type();
     }
 
@@ -2654,6 +3074,9 @@ public:
         for (uint64_t j = 0;
              j < get_out_of_place_used_elements(leaf_data_start.get_pointer());
              j++) {
+          if constexpr (!binary) {
+            (merged_mp + start + j).zero();
+          }
           merged_mp[start + j] = ptr_to_temp[j];
         }
 
@@ -2661,10 +3084,16 @@ public:
       } else if (std::get<0>(index_to_head(leaf_start_index + i)) != 0) {
 
         if constexpr (!head_in_place) {
+          if constexpr (!binary) {
+            (merged_mp + start).zero();
+          }
           merged_mp[start] = index_to_head(leaf_start_index + i);
           start += 1;
         }
         for (uint64_t j = 0; j < end - start; j++) {
+          if constexpr (!binary) {
+            (merged_mp + start + j).zero();
+          }
           merged_mp[start + j] =
               (leaf_data_start - ((head_in_place) ? 1 : 0))[j];
         }
@@ -2704,19 +3133,19 @@ public:
   }
 
   // TODO(wheatman) make leaf_size_in_bytes number of elements
-  template <bool head_in_place, bool have_densities, typename F,
+  template <bool head_in_place, bool have_densities, bool parallel, typename F,
             typename density_array_type>
   static merged_data merge(element_ptr_type array, uint64_t num_leaves,
                            uint64_t leaf_size_in_bytes,
                            uint64_t leaf_start_index, F index_to_head,
                            density_array_type density_array) {
-#if PARALLEL == 1
-    if (num_leaves > ParallelTools::getWorkers() * 100U) {
-      return parallel_merge<head_in_place, have_densities>(
-          array, num_leaves, leaf_size_in_bytes, leaf_start_index,
-          index_to_head, density_array);
+    if constexpr (parallel) {
+      if (num_leaves > ParallelTools::getWorkers() * 100U) {
+        return parallel_merge<head_in_place, have_densities>(
+            array, num_leaves, leaf_size_in_bytes, leaf_start_index,
+            index_to_head, density_array);
+      }
     }
-#endif
 
     uint64_t leaf_size = leaf_size_in_bytes / sizeof(T);
 
@@ -2734,7 +3163,7 @@ public:
       }
     }
 
-    uint64_t memory_size = dest_size;
+    uint64_t memory_size = dest_size + num_leaves;
     void *merged_arr_base = malloc(SOA_type::get_size_static(memory_size));
     auto merged_mp = SOA_type::get_static_ptr(merged_arr_base, memory_size, 0);
 
@@ -2755,6 +3184,9 @@ public:
         for (uint64_t j = 0;
              j < get_out_of_place_used_elements(leaf_data_start.get_pointer());
              j++) {
+          if constexpr (!binary) {
+            (merged_mp + start + j).zero();
+          }
           merged_mp[start + j] = ptr_to_temp[j];
         }
 
@@ -2762,22 +3194,25 @@ public:
 
         start += get_out_of_place_used_elements(leaf_data_start.get_pointer());
       } else { // otherwise, reading regular leaf
-        merged_mp[start] = index_to_head(leaf_start_index + i);
-        start += (std::get<0>(index_to_head(leaf_start_index + i)) != 0);
+        (merged_mp + start).set_and_zero(index_to_head(leaf_start_index + i));
+        start += (std::get<0>(merged_mp[start]) != 0);
         uint64_t local_start = start;
         if constexpr (head_in_place) {
           for (uint64_t j = 0; j < leaf_size - 1; j++) {
-            merged_mp[local_start + j] = array[j + src_idx + 1];
             if constexpr (!have_densities) {
               start += (array.get(j + src_idx + 1) != 0);
             }
+            if constexpr (!binary) {
+              (merged_mp + local_start + j).zero();
+            }
+            merged_mp[local_start + j] = array[j + src_idx + 1];
           }
         } else {
           for (uint64_t j = 0; j < leaf_size; j++) {
-            merged_mp[local_start + j] = array[j + src_idx];
             if constexpr (!have_densities) {
               start += (array.get(j + src_idx) != 0);
             }
+            (merged_mp + local_start + j).set_and_zero(array[j + src_idx]);
           }
         }
         if constexpr (have_densities) {
@@ -2791,6 +3226,10 @@ public:
 
     // fill in the rest of the leaf with 0
     for (uint64_t i = start; i < memory_size; i++) {
+      if constexpr (!binary) {
+        // the key needs to be a simple type that this is not needed for
+        (merged_mp + i).zero();
+      }
       merged_mp[i] = element_type();
     }
 
@@ -2810,12 +3249,15 @@ public:
   // you have num_leaves * num_bytes bytes available here to write to)
   // output: split input leaf into num_leaves leaves, each with
   // num_output_bytes bytes
-  template <bool head_in_place, bool store_densities, typename F,
-            typename density_array_type>
+  template <bool head_in_place, bool store_densities, bool support_rank,
+            bool parallel, typename F, typename density_array_type,
+            typename rank_tree_array_type>
   void split(uint64_t num_leaves, const uint64_t num_elements,
              uint64_t bytes_per_leaf, element_ptr_type dest_region,
              uint64_t leaf_start_index, F index_to_head,
-             density_array_type density_array) const {
+             density_array_type density_array,
+             rank_tree_array_type rank_tree_array,
+             uint64_t total_leaves) const {
 
     split_cnt.add(num_leaves);
     uint64_t elements_per_leaf = bytes_per_leaf / sizeof(T);
@@ -2826,143 +3268,286 @@ public:
 
     assert(count_per_leaf + (extra > 0) <= elements_per_leaf);
 
-    if ((PARALLEL == 0) || num_leaves <= 1UL << 12UL) {
-      for (uint64_t i = 0; i < num_leaves; i++) {
-        uint64_t j3 = count_per_leaf * i + std::min(i, extra) - 1;
-        if (i == 0) {
+    if constexpr (parallel) {
+      if (num_leaves > 1UL << 12UL) {
+        {
+          // first loop not in parallel due to weird compiler behavior
+          uint64_t i = 0;
+          const uint64_t j3 = 0;
           index_to_head(leaf_start_index) = head;
-          j3 = 0;
-        } else {
-          index_to_head(leaf_start_index + i) = array[j3];
-          j3 += 1;
-        }
-        uint64_t out = i * elements_per_leaf;
-        // -1 for head
-        uint64_t count_for_leaf = count_per_leaf + (i < extra) - 1;
-        if (count_for_leaf == std::numeric_limits<uint64_t>::max()) {
-          count_for_leaf = 0;
-        }
-        ASSERT(j3 + count_for_leaf <= length_in_elements,
-               "j3 = %lu, count_for_leaf = %lu, length_in_elements = %lu\n", j3,
-               count_for_leaf, length_in_elements);
-        if constexpr (head_in_place) {
-          out += 1;
-        }
-        for (uint64_t k = 0; k < count_for_leaf; k++) {
-          dest_region[out + k] = array[j3 + k];
-        }
-        if constexpr (store_densities) {
-          density_array[leaf_start_index + i] = count_for_leaf * sizeof(T);
+          uint64_t out = 0;
+          // -1 for head
+          uint64_t count_for_leaf = count_per_leaf + (i < extra) - 1;
+          if (count_for_leaf == std::numeric_limits<uint64_t>::max()) {
+            count_for_leaf = 0;
+          }
+          ASSERT(j3 + count_for_leaf <= length_in_elements,
+                 "j3 = %lu, count_for_leaf = %lu, length_in_elements = %lu\n",
+                 j3, count_for_leaf, length_in_elements);
           if constexpr (head_in_place) {
-            // for head
-            if (std::get<0>(index_to_head(leaf_start_index + i)) != 0) {
-              density_array[leaf_start_index + i] += sizeof(T);
+            out += 1;
+          }
+          for (uint64_t k = 0; k < count_for_leaf; k++) {
+            if constexpr (!binary) {
+              (dest_region + out + k).zero();
+            }
+            dest_region[out + k] = array[j3 + k];
+          }
+          if constexpr (store_densities) {
+            density_array[leaf_start_index + i] = count_for_leaf * sizeof(T);
+            if constexpr (head_in_place) {
+              // for head
+              if (std::get<0>(index_to_head(leaf_start_index)) != 0) {
+                density_array[leaf_start_index + i] += sizeof(T);
+              }
+            }
+          }
+          if constexpr (support_rank) {
+            if (i < nextPowerOf2(total_leaves) - 1 &&
+                i < nextPowerOf2(num_leaves) - 1) {
+              uint64_t running_element_total = 1 + count_for_leaf;
+              uint64_t my_e_index =
+                  e_index(leaf_start_index + i, total_leaves - 1);
+              rank_tree_array[my_e_index] = running_element_total;
+            }
+          }
+          if constexpr (head_in_place) {
+            for (uint64_t k = 0; k < elements_per_leaf - count_for_leaf - 1;
+                 k++) {
+              if constexpr (!binary) {
+                // the key needs to be a simple type that this is not needed for
+                (dest_region + out + count_for_leaf + k).zero();
+              }
+              dest_region[out + count_for_leaf + k] = element_type();
+            }
+          } else {
+            for (uint64_t k = 0; k < elements_per_leaf - count_for_leaf; k++) {
+              if constexpr (!binary) {
+                // the key needs to be a simple type that this is not needed for
+                (dest_region + out + count_for_leaf + k).zero();
+              }
+              dest_region[out + count_for_leaf + k] = element_type();
             }
           }
         }
-
-        if constexpr (head_in_place) {
-          for (uint64_t k = 0; k < elements_per_leaf - count_for_leaf - 1;
-               k++) {
-            dest_region[out + count_for_leaf + k] = element_type();
+        // seperate loops due to more weird compiler behavior
+        ParallelTools::parallel_for(1, num_leaves, [&](uint64_t i) {
+          uint64_t j3 = count_per_leaf * i + std::min(i, extra);
+          index_to_head(leaf_start_index + i) = array[j3 - 1];
+        });
+        ParallelTools::parallel_for(1, num_leaves, [&](uint64_t i) {
+          const uint64_t j3 = count_per_leaf * i + std::min(i, extra);
+          uint64_t out = i * elements_per_leaf;
+          // -1 for head
+          uint64_t count_for_leaf = count_per_leaf + (i < extra) - 1;
+          if (count_for_leaf == std::numeric_limits<uint64_t>::max()) {
+            count_for_leaf = 0;
           }
-
-        } else {
-          for (uint64_t k = 0; k < elements_per_leaf - count_for_leaf; k++) {
-            dest_region[out + count_for_leaf + k] = element_type();
+          ASSERT(j3 + count_for_leaf <= length_in_elements,
+                 "j3 = %lu, count_for_leaf = %lu, length_in_elements = %lu\n",
+                 j3, count_for_leaf, length_in_elements);
+          if constexpr (head_in_place) {
+            out += 1;
           }
+          for (uint64_t k = 0; k < count_for_leaf; k++) {
+            if constexpr (!binary) {
+              (dest_region + out + k).zero();
+            }
+            dest_region[out + k] = array[j3 + k];
+          }
+          if constexpr (store_densities) {
+            density_array[leaf_start_index + i] = count_for_leaf * sizeof(T);
+            if constexpr (head_in_place) {
+              // for head
+              if (std::get<0>(index_to_head(leaf_start_index + i)) != 0) {
+                density_array[leaf_start_index + i] += sizeof(T);
+              }
+            }
+          }
+          if constexpr (support_rank) {
+            if (i < nextPowerOf2(total_leaves) - 1 &&
+                i < nextPowerOf2(num_leaves) - 1) {
+              // j3 is the number of elements I wrote in past leaves
+              // second +1 is the head of this leaf, not counted for in
+              // count_for_leaf
+              uint64_t running_element_total = j3 + 1 + count_for_leaf;
+              uint64_t my_e_index =
+                  e_index(leaf_start_index + i, total_leaves - 1);
+              uint64_t parent_i_plus_1 = (i + 1) & i;
+              uint64_t parent_j3 = count_per_leaf * parent_i_plus_1 +
+                                   std::min(parent_i_plus_1, extra);
+              uint64_t parent_running_element_total = parent_j3;
+              if (parent_i_plus_1 == 0) {
+                parent_running_element_total = 0;
+              }
+              rank_tree_array[my_e_index] =
+                  running_element_total - parent_running_element_total;
+            }
+          }
+          if constexpr (head_in_place) {
+            for (uint64_t k = 0; k < elements_per_leaf - count_for_leaf - 1;
+                 k++) {
+              if constexpr (!binary) {
+                // the key needs to be a simple type that this is not needed for
+                (dest_region + out + count_for_leaf + k).zero();
+              }
+              dest_region[out + count_for_leaf + k] = element_type();
+            }
+          } else {
+            for (uint64_t k = 0; k < elements_per_leaf - count_for_leaf; k++) {
+              if constexpr (!binary) {
+                // the key needs to be a simple type that this is not needed for
+                (dest_region + out + count_for_leaf + k).zero();
+              }
+              dest_region[out + count_for_leaf + k] = element_type();
+            }
+          }
+        });
+        if constexpr (support_rank) {
+          ParallelTools::parallel_for(
+              num_leaves,
+              std::min(nextPowerOf2(num_leaves) - 1,
+                       nextPowerOf2(total_leaves)),
+              [&](uint64_t i) {
+                // j3 is the number of elements I wrote in past leaves
+                // first +1 is for the original head, not counted for in j3
+                // second +1 is the head of this leaf, not counted for in
+                // count_for_leaf
+                uint64_t running_element_total = num_elements;
+                uint64_t my_e_index =
+                    e_index(leaf_start_index + i, total_leaves - 1);
+                uint64_t parent_i_plus_1 = (i + 1) & i;
+                uint64_t parent_j3 = count_per_leaf * parent_i_plus_1 +
+                                     std::min(parent_i_plus_1, extra);
+                uint64_t parent_running_element_total = parent_j3;
+                if (parent_i_plus_1 == 0) {
+                  parent_running_element_total = 0;
+                }
+                if (parent_running_element_total > running_element_total) {
+                  rank_tree_array[my_e_index] = 0;
+                } else {
+                  rank_tree_array[my_e_index] =
+                      running_element_total - parent_running_element_total;
+                }
+              });
         }
+        return;
       }
-    } else {
-      {
-        // first loop not in parallel due to weird compiler behavior
-        uint64_t i = 0;
-        const uint64_t j3 = 0;
-        index_to_head(leaf_start_index) = head;
-        uint64_t out = 0;
-        // -1 for head
-        uint64_t count_for_leaf = count_per_leaf + (i < extra) - 1;
-        if (count_for_leaf == std::numeric_limits<uint64_t>::max()) {
-          count_for_leaf = 0;
-        }
-        ASSERT(j3 + count_for_leaf <= length_in_elements,
-               "j3 = %lu, count_for_leaf = %lu, length_in_elements = %lu\n", j3,
-               count_for_leaf, length_in_elements);
-        if constexpr (head_in_place) {
-          out += 1;
-        }
-        for (uint64_t k = 0; k < count_for_leaf; k++) {
-          dest_region[out + k] = array[j3 + k];
-        }
-        if constexpr (store_densities) {
-          density_array[leaf_start_index + i] = count_for_leaf * sizeof(T);
-          if constexpr (head_in_place) {
-            // for head
-            if (std::get<0>(index_to_head(leaf_start_index)) != 0) {
-              density_array[leaf_start_index + i] += sizeof(T);
-            }
-          }
-        }
-        if constexpr (head_in_place) {
-          for (uint64_t k = 0; k < elements_per_leaf - count_for_leaf - 1;
-               k++) {
-            dest_region[out + count_for_leaf + k] = element_type();
-          }
-        } else {
-          for (uint64_t k = 0; k < elements_per_leaf - count_for_leaf; k++) {
-            dest_region[out + count_for_leaf + k] = element_type();
-          }
-        }
-      }
-      // seperate loops due to more weird compiler behavior
-      ParallelTools::parallel_for(1, num_leaves, [&](uint64_t i) {
-        uint64_t j3 = count_per_leaf * i + std::min(i, extra);
-        index_to_head(leaf_start_index + i) = array[j3 - 1];
-      });
-      ParallelTools::parallel_for(1, num_leaves, [&](uint64_t i) {
-        const uint64_t j3 = count_per_leaf * i + std::min(i, extra);
-        uint64_t out = i * elements_per_leaf;
-        // -1 for head
-        uint64_t count_for_leaf = count_per_leaf + (i < extra) - 1;
-        if (count_for_leaf == std::numeric_limits<uint64_t>::max()) {
-          count_for_leaf = 0;
-        }
-        ASSERT(j3 + count_for_leaf <= length_in_elements,
-               "j3 = %lu, count_for_leaf = %lu, length_in_elements = %lu\n", j3,
-               count_for_leaf, length_in_elements);
-        if constexpr (head_in_place) {
-          out += 1;
-        }
-        for (uint64_t k = 0; k < count_for_leaf; k++) {
-          dest_region[out + k] = array[j3 + k];
-        }
-        if constexpr (store_densities) {
-          density_array[leaf_start_index + i] = count_for_leaf * sizeof(T);
-          if constexpr (head_in_place) {
-            // for head
-            if (std::get<0>(index_to_head(leaf_start_index + i)) != 0) {
-              density_array[leaf_start_index + i] += sizeof(T);
-            }
-          }
-        }
-        if constexpr (head_in_place) {
-          for (uint64_t k = 0; k < elements_per_leaf - count_for_leaf - 1;
-               k++) {
-            dest_region[out + count_for_leaf + k] = element_type();
-          }
-        } else {
-          for (uint64_t k = 0; k < elements_per_leaf - count_for_leaf; k++) {
-            dest_region[out + count_for_leaf + k] = element_type();
-          }
-        }
-      });
     }
+
+    for (uint64_t i = 0; i < num_leaves; i++) {
+      uint64_t j3 = count_per_leaf * i + std::min(i, extra) - 1;
+      if (i == 0) {
+        element_ptr_type(index_to_head(leaf_start_index)).set(head);
+        j3 = 0;
+      } else {
+        element_ptr_type(index_to_head(leaf_start_index + i)).set(array[j3]);
+        j3 += 1;
+      }
+      uint64_t out = i * elements_per_leaf;
+      // -1 for head
+      uint64_t count_for_leaf = count_per_leaf + (i < extra) - 1;
+      if (count_for_leaf == std::numeric_limits<uint64_t>::max()) {
+        count_for_leaf = 0;
+      }
+      ASSERT(j3 + count_for_leaf <= length_in_elements,
+             "j3 = %lu, count_for_leaf = %lu, length_in_elements = %lu\n", j3,
+             count_for_leaf, length_in_elements);
+      if constexpr (head_in_place) {
+        out += 1;
+      }
+      for (uint64_t k = 0; k < count_for_leaf; k++) {
+        (dest_region + out + k).set(array[j3 + k]);
+      }
+      if constexpr (store_densities) {
+        density_array[leaf_start_index + i] = count_for_leaf * sizeof(T);
+        if constexpr (head_in_place) {
+          // for head
+          if (std::get<0>(index_to_head(leaf_start_index + i)) != 0) {
+            density_array[leaf_start_index + i] += sizeof(T);
+          }
+        }
+      }
+      if constexpr (support_rank) {
+        if (i < nextPowerOf2(total_leaves) - 1 &&
+            i < nextPowerOf2(num_leaves) - 1) {
+          uint64_t running_element_total = j3 + 1 + count_for_leaf;
+          uint64_t my_e_index = e_index(leaf_start_index + i, total_leaves - 1);
+          uint64_t parent_i_plus_1 = (i + 1) & i;
+          uint64_t parent_j3 = count_per_leaf * parent_i_plus_1 +
+                               std::min(parent_i_plus_1, extra);
+          uint64_t parent_running_element_total = parent_j3;
+          if (parent_i_plus_1 == 0) {
+            parent_running_element_total = 0;
+          }
+          rank_tree_array[my_e_index] =
+              running_element_total - parent_running_element_total;
+        }
+      }
+      if constexpr (head_in_place) {
+        for (uint64_t k = 0; k < elements_per_leaf - count_for_leaf - 1; k++) {
+          if constexpr (!binary) {
+            // the key needs to be a simple type that this is not needed for
+            (dest_region + out + count_for_leaf + k).zero();
+          }
+          dest_region[out + count_for_leaf + k] = element_type();
+        }
+
+      } else {
+        for (uint64_t k = count_for_leaf; k < elements_per_leaf; k++) {
+          if constexpr (!binary) {
+            // the key needs to be a simple type that this is not needed for
+            (dest_region + out + k).zero();
+          }
+          dest_region[out + k] = element_type();
+        }
+      }
+    }
+
+    if constexpr (support_rank) {
+      for (uint64_t i = num_leaves; i < nextPowerOf2(num_leaves) - 1 &&
+                                    i < nextPowerOf2(total_leaves) - 1;
+           i++) {
+        uint64_t running_element_total = num_elements;
+        uint64_t my_e_index = e_index(leaf_start_index + i, total_leaves - 1);
+        uint64_t parent_i_plus_1 = (i + 1) & i;
+        uint64_t parent_j3 =
+            count_per_leaf * parent_i_plus_1 + std::min(parent_i_plus_1, extra);
+        uint64_t parent_running_element_total = parent_j3;
+        if (parent_i_plus_1 == 0) {
+          parent_running_element_total = 0;
+        }
+        if (parent_running_element_total > running_element_total) {
+          rank_tree_array[my_e_index] = 0;
+        } else {
+          rank_tree_array[my_e_index] =
+              running_element_total - parent_running_element_total;
+        }
+      }
+    }
+  }
+
+  template <typename... Ts, std::size_t... I>
+  void tuple_bit_swap_impl(std::tuple<Ts &...> a, std::tuple<Ts...> &b,
+                           std::index_sequence<I...>) {
+    (std::swap(std::get<I>(a), std::get<I>(b)), ...);
+  }
+
+  void tuple_bit_swap(element_ref_type a, element_type &b) {
+    tuple_bit_swap_impl(a, b, std::make_index_sequence<1 + sizeof...(VTs)>{});
   }
 
   // inserts an element
   // first return value indicates if something was inserted
   // if something was inserted the second value tells you the current size
-  template <bool head_in_place> std::pair<bool, size_t> insert(element_type x) {
+  template <bool head_in_place, typename ValueUpdate = std::nullptr_t>
+  std::pair<bool, size_t> insert(element_type x,
+                                 ValueUpdate value_update = {}) {
+    static_assert(
+        binary ||
+            std::is_invocable_v<ValueUpdate, element_ref_type, element_type &>,
+        "the value update function must take in a reference to the current "
+        "value and the new value by reference");
 #if DEBUG == 1
     if (!check_increasing_or_zero()) {
       print();
@@ -2970,16 +3555,15 @@ public:
     }
 #endif
     assert(array.get(length_in_elements - 1) == 0);
+    assert(std::get<0>(x) != 0);
     if (std::get<0>(x) == head_key()) {
       if constexpr (!binary) {
-        head = x;
+        value_update(head, x);
       }
       return {false, 0};
     }
     if (std::get<0>(x) < head_key()) {
-      element_type temp = head;
-      head = x;
-      x = temp;
+      tuple_bit_swap(head, x);
     }
     if (head_key() == 0) {
       head = x;
@@ -2988,7 +3572,7 @@ public:
     uint64_t fr = find(std::get<0>(x));
     if (array.get(fr) == std::get<0>(x)) {
       if constexpr (!binary) {
-        array[fr] = x;
+        value_update(array[fr], x);
       }
       return {false, 0};
     }
@@ -2997,15 +3581,13 @@ public:
     //   num_elements += (array[i - 1] != 0);
     //   array[i] = array[i - 1];
     // }
-    element_type old = array[fr];
-    for (uint64_t i = fr; i < length_in_elements - 1; i++) {
-      element_type next = array[i + 1];
-      array[i + 1] = old;
-      if (std::get<0>(old) == 0) {
-        break;
-      }
-      old = next;
-      num_elements += 1;
+    // for (uint64_t i = fr; i < length_in_elements - 1; i++)
+    for (uint64_t i = length_in_elements - 1; i > fr; i--) {
+      (array + i).set_and_zero(array[i - 1]);
+      num_elements += (std::get<0>(array[i]) != 0);
+    }
+    if constexpr (!binary) {
+      (array + fr).zero();
     }
     array[fr] = x;
 #if DEBUG == 1
@@ -3015,6 +3597,69 @@ public:
     }
 #endif
     return {true, num_elements * sizeof(T) + ((head_in_place) ? sizeof(T) : 0)};
+  }
+
+  template <bool head_in_place>
+  std::pair<bool, size_t> insert_by_rank(element_type x, uint64_t rank) {
+    assert(array[length_in_elements - 1] == 0);
+    if (head_key() == 0) {
+      // if the leaf is empty
+      head = x;
+      return {true, (head_in_place) ? sizeof(T) : 0};
+    }
+    if (rank == 0) {
+      element_type temp = head;
+      head = x;
+      x = temp;
+      rank = 1;
+    }
+    // something happened so we don't know the exact rank, but we should go to
+    // the end
+    if (rank == std::numeric_limits<uint64_t>::max()) {
+      size_t num_elements = 0;
+      for (uint64_t i = 0; i < length_in_elements; i++) {
+        num_elements += (array.get(i) != 0);
+      }
+      array[num_elements] = x;
+      return {true, (num_elements + 1) * sizeof(T) +
+                        ((head_in_place) ? sizeof(T) : 0)};
+    }
+
+    uint64_t fr = rank - 1;
+    size_t num_elements = fr + 1;
+    for (uint64_t i = length_in_elements - 1; i >= fr + 1; i--) {
+      num_elements += (array.get(i - 1) != 0);
+      array[i] = array[i - 1];
+    }
+    array[fr] = x;
+    return {true, num_elements * sizeof(T) + ((head_in_place) ? sizeof(T) : 0)};
+  }
+
+  template <bool head_in_place>
+  std::pair<bool, size_t> update_by_rank(T x, uint64_t rank) {
+    assert(array[length_in_elements - 1] == 0);
+    if (head == 0) {
+      // if the leaf is empty
+      head = x;
+      return {true, (head_in_place) ? sizeof(T) : 0};
+    }
+    if (rank == 0) {
+      head = x;
+      return {false, 0};
+    }
+    // something happened so we don't know the exact rank, but we should go to
+    // the end
+    if (rank == std::numeric_limits<uint64_t>::max()) {
+      size_t num_elements = 0;
+      for (uint64_t i = 0; i < length_in_elements; i++) {
+        num_elements += (array[i] != 0);
+      }
+      array[num_elements] = x;
+      return {true, (num_elements + 1) * sizeof(T) +
+                        ((head_in_place) ? sizeof(T) : 0)};
+    }
+    array[rank - 1] = x;
+    return {false, 0};
   }
 
   // removes an element
@@ -3038,7 +3683,10 @@ public:
     for (uint64_t i = fr; i < length_in_elements - 1; i++) {
       array[i] = array[i + 1];
     }
-
+    if constexpr (!binary) {
+      // the key needs to be a simple type that this is not needed for
+      (array + length_in_elements - 1).zero();
+    }
     array[length_in_elements - 1] = element_type();
     size_t num_elements = fr;
     for (uint64_t i = fr; i < length_in_elements; i++) {
@@ -3170,7 +3818,7 @@ public:
     return num_elements * sizeof(T);
   }
 
-  // doesn't consider overflow
+  // for use in rank counts, doesn't consider overflow
   [[nodiscard]] size_t element_count() const {
     size_t num_elements = 0;
     for (uint64_t i = 0; i < length_in_elements; i++) {
@@ -3234,7 +3882,7 @@ public:
         return it;
       }
     }
-    return iterator(0, array);
+    return iterator(zero_element_ptr(), array);
   }
 
   iterator lower_bound(key_type key, iterator it) {
@@ -3243,7 +3891,7 @@ public:
         return it;
       }
     }
-    return iterator(0, array);
+    return iterator(zero_element_ptr(), array);
   }
 
   [[nodiscard]] bool check_increasing_or_zero(bool external = false) const {
@@ -3270,7 +3918,7 @@ public:
       if (array.get(i) == 0) {
         continue;
       }
-      if (array[i] <= check) {
+      if (std::get<0>(array[i]) <= std::get<0>(check)) {
         std::cout << "bad in position " << i << std::endl;
         std::cout << array[i] << " <= " << check << std::endl;
         return false;

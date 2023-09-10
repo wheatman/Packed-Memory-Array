@@ -15,6 +15,9 @@
 #include <stdint.h>
 #include <string>
 #include <sys/time.h>
+#include <tuple>
+#include <type_traits>
+#include <utility>
 #include <vector>
 #include <x86intrin.h>
 #ifndef NDEBUG
@@ -37,33 +40,48 @@ class __attribute__((__packed__)) uint24_t {
   std::array<uint8_t, 3> data = {0};
 
 public:
-  constexpr operator uint32_t() const {
-    uint32_t x =
-        static_cast<uint32_t>(data[0] | (data[1] << 8U) | (data[2] << 16U));
-    return x;
+  [[nodiscard]] constexpr uint32_t convert_to_32bit() const {
+    return static_cast<uint32_t>(static_cast<uint32_t>(data[0]) |
+                                 (static_cast<uint32_t>(data[1]) << 8U) |
+                                 (static_cast<uint32_t>(data[2]) << 16U));
   }
+  constexpr operator uint32_t() const { return convert_to_32bit(); }
   constexpr uint24_t &operator+=(uint32_t y) {
-    uint32_t x =
-        static_cast<uint32_t>(data[0] | (data[1] << 8U) | (data[2] << 16U));
+    uint32_t x = convert_to_32bit();
     x += y;
-    data[0] = x & 0xFF;
-    data[1] = (x >> 8U) & 0xFF;
-    data[2] = (x >> 16U) & 0xFF;
+    data[0] = x & 0xFFU;
+    data[1] = (x >> 8U) & 0xFFU;
+    data[2] = (x >> 16U) & 0xFFU;
     return *this;
   }
   constexpr uint24_t &operator-=(uint32_t y) {
-    uint32_t x =
-        static_cast<uint32_t>(data[0] | (data[1] << 8U) | (data[2] << 16U));
+    uint32_t x = convert_to_32bit();
     x -= y;
-    data[0] = x & 0xFF;
-    data[1] = (x >> 8U) & 0xFF;
-    data[2] = (x >> 16U) & 0xFF;
+    data[0] = x & 0xFFU;
+    data[1] = (x >> 8U) & 0xFFU;
+    data[2] = (x >> 16U) & 0xFFU;
+    return *this;
+  }
+  constexpr uint24_t &operator++() {
+    uint32_t x = convert_to_32bit();
+    x++;
+    data[0] = x & 0xFFU;
+    data[1] = (x >> 8U) & 0xFFU;
+    data[2] = (x >> 16U) & 0xFFU;
+    return *this;
+  }
+  constexpr uint24_t &operator--() {
+    uint32_t x = convert_to_32bit();
+    x--;
+    data[0] = x & 0xFFU;
+    data[1] = (x >> 8U) & 0xFFU;
+    data[2] = (x >> 16U) & 0xFFU;
     return *this;
   }
   constexpr uint24_t(uint64_t x) {
-    data[0] = x & 0xFF;
-    data[1] = (x >> 8U) & 0xFF;
-    data[2] = (x >> 16U) & 0xFF;
+    data[0] = x & 0xFFU;
+    data[1] = (x >> 8U) & 0xFFU;
+    data[2] = (x >> 16U) & 0xFFU;
   }
   constexpr uint24_t() = default;
 };
@@ -74,17 +92,12 @@ public:
   static constexpr uint24_t max() { return uint24_t((1UL << 24U) - 1); }
   // One can implement other methods if needed
 };
+template <> class is_unsigned<uint24_t> {
+public:
+  static constexpr bool value() { return true; }
+  // One can implement other methods if needed
+};
 } // namespace std
-
-template <typename T> T *newA(size_t n) { return (T *)malloc(n * sizeof(T)); }
-
-#define watch(x) (#x) << "=" << (x) << std::endl;
-
-#define REPORT2(a, b) watch(a) << ", " << watch(b) << std::endl;
-#define REPORT3(a, b, c) REPORT2(a, b) << ", " << watch(c) << std::endl;
-#define REPORT4(a, b, c, d) REPORT3(a, b, c) << ", " << watch(d) << std::endl;
-#define REPORT5(a, b, c, d, e)                                                 \
-  REPORT4(a, b, c, d) << ", " << watch(e) << std::endl;
 
 #define intT int32_t
 #define uintT uint32_t
@@ -189,7 +202,7 @@ void releaseVectorWrapper(std::vector<T, std::allocator<T>> &targetVector) {
       (typename std::_Vector_base<T, std::allocator<T>>::_Vector_impl *)((
           void *)&targetVector);
   vectorPtr->_M_start = vectorPtr->_M_finish = vectorPtr->_M_end_of_storage =
-      NULL;
+      nullptr;
 }
 
 template <class T> T prefix_sum_inclusive(std::vector<T> &data) {
@@ -226,9 +239,9 @@ static uint64_t tzcnt(uint64_t num) {
   return _tzcnt_u64(num);
 #endif
   uint64_t count = 0;
-  while ((num & 1) == 0) {
+  while ((num & 1U) == 0) {
     count += 1;
-    num >>= 1;
+    num >>= 1U;
   }
   return count;
 }
@@ -259,6 +272,20 @@ static uint64_t tzcnt(uint64_t num) {
                                                         uint64_t length) {
   uint64_t my_e_index = e_index(index, length);
   return e_first_left_parent_eindex(my_e_index);
+}
+
+[[nodiscard]] inline uint64_t
+rank_tree_array_get_prior_in_range(uint64_t index, uint64_t length,
+                                   uint64_t min_e_index,
+                                   uint64_t *rank_tree_array) {
+  uint64_t left_parent_e_index = e_first_left_parent_index(index, length);
+  uint64_t total = 0;
+  while (left_parent_e_index != std::numeric_limits<uint64_t>::max() &&
+         left_parent_e_index >= min_e_index) {
+    total += rank_tree_array[left_parent_e_index];
+    left_parent_e_index = e_first_left_parent_eindex(left_parent_e_index);
+  }
+  return total;
 }
 
 template <uint64_t B>
@@ -352,8 +379,71 @@ leftshift_tuple(const std::tuple<T1, rest...> &tuple) {
                     tuple);
 }
 
+template <typename... T>
+constexpr void add_to_tuple(const std::tuple<T &...> &t1,
+                            const std::tuple<T...> &t2) {
+  if constexpr (sizeof...(T) > 0) {
+    std::get<0>(t1) += std::get<0>(t2);
+  }
+  if constexpr (sizeof...(T) > 1) {
+    add_to_tuple(leftshift_tuple(t1), leftshift_tuple(t2));
+  }
+}
+
+template <typename... Args, std::size_t... I>
+std::tuple<Args &...> MakeTupleRef(std::tuple<Args...> &tuple,
+                                   std::index_sequence<I...>) {
+  return std::tie(std::get<I>(tuple)...);
+}
+
+template <typename... Args>
+std::tuple<Args &...> MakeTupleRef(std::tuple<Args...> &tuple) {
+  return MakeTupleRef(tuple, std::make_index_sequence<sizeof...(Args)>{});
+}
+
+template <typename T1, typename T2>
+constexpr bool approx_equal_tuple(const T1 &t1, const T2 &t2) {
+  static_assert(std::tuple_size_v<T1> == std::tuple_size_v<T2>);
+  // clang-format off
+  if constexpr (std::tuple_size_v<T1> == 0) {
+    return true;
+  }
+  bool close_enough = true;
+  if constexpr (std::tuple_size_v<T1> > 1) {
+    close_enough = approx_equal_tuple(leftshift_tuple(t1), leftshift_tuple(t2));
+  }
+  // clang-format on
+  if constexpr (std::is_integral_v<std::tuple_element<0, T1>> &&
+                std::is_integral_v<std::tuple_element<0, T2>>) {
+    close_enough &= (std::get<0>(t1) == std::get<0>(t2));
+  } else {
+    auto a = std::get<0>(t1);
+    auto b = std::get<0>(t2);
+    if (a == 0 || b == 0) {
+      close_enough |= (std::abs((double)a + (double)b) < .000000001);
+    } else {
+      auto bigger = (a > b) ? a : b;
+      auto smaller = (a > b) ? b : a;
+      close_enough |= (bigger / smaller < 1.00000001);
+    }
+  }
+  return close_enough;
+}
+
 struct free_delete {
   void operator()(void *x) { free(x); }
 };
+
+// returns the log base 2 rounded up (works on ints or longs or unsigned
+// versions)
+template <class T> size_t log2_up(T i) {
+  size_t a = 0;
+  T b = i - 1;
+  while (b > 0) {
+    b = b >> 1U;
+    a++;
+  }
+  return a;
+}
 
 #endif

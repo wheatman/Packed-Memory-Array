@@ -1,6 +1,6 @@
 #pragma once
 
-#include "helpers.h"
+#include "helpers.hpp"
 #include <cstdint>
 #include <iostream> // cout
 #include <string>
@@ -32,7 +32,7 @@ public:
 #if ENABLE_TRACE_TIMER == 1
   timer(std::string n) : name(std::move(n)) {}
 #else
-  template <typename T> timer([[maybe_unused]] T n) {}
+  template <typename T> timer([[maybe_unused]] T n) noexcept {}
 #endif
 
   inline void start() {
@@ -88,7 +88,7 @@ public:
 #if ENABLE_TRACE_COUNTER == 1
   counter(std::string n) : name(std::move(n)) {}
 #else
-  template <typename T> counter([[maybe_unused]] T n) {}
+  template <typename T> counter([[maybe_unused]] T n) noexcept {}
 #endif
 
   inline void add([[maybe_unused]] uint64_t x) {

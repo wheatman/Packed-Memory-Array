@@ -3,7 +3,7 @@
 #include "tlx/container/btree.hpp"
 
 // copied from the tlx source code so we can get access to the size of the nodes
-// to meausre the total memory usage
+// to meausure the total memory usage
 
 template <typename Key, typename Value, typename KeyOfValue,
           typename Compare = std::less<Key>,

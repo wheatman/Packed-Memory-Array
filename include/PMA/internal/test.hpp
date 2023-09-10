@@ -1,16 +1,19 @@
 #pragma once
 
-#include "CPMA.hpp"
+#include "PMA/CPMA.hpp"
+#include "PMA/PMAkv.hpp"
 #include "ParallelTools/parallel.h"
 #include "ParallelTools/reducer.h"
+#include <cstddef>
 #include <cstdint>
 
-#include "helpers.h"
-#include "io_util.h"
-#include "leaf.hpp"
+#include "PMA/internal/helpers.hpp"
+#include "PMA/internal/io_util.hpp"
+#include "PMA/internal/leaf.hpp"
+#include "PMA/internal/rmat_util.hpp"
+#include "PMA/internal/zipf.hpp"
+#include "parlay/primitives.h"
 #include "parlay/sequence.h"
-#include "rmat_util.h"
-#include "zipf.hpp"
 
 #include "EdgeMapVertexMap/algorithms/BC.h"
 #include "EdgeMapVertexMap/algorithms/BFS.h"
@@ -42,12 +45,15 @@
 template <class T>
 std::vector<T> create_random_data_with_seed(size_t n, size_t max_val,
                                             std::seed_seq &seed) {
-
+  assert(n < (size_t)std::numeric_limits<T>::max());
+  if (max_val > (size_t)std::numeric_limits<T>::max()) {
+    max_val = (size_t)std::numeric_limits<T>::max();
+  }
   if constexpr (std::is_same_v<T, uint24_t>) {
     std::mt19937_64 eng(seed); // a source of random data
 
     std::uniform_int_distribution<uint64_t> dist(0,
-                                                 std::min(max_val, 1UL << 24));
+                                                 std::min(max_val, 1UL << 24U));
     std::vector<uint64_t> v(n);
     for (auto &el : v) {
       el = dist(eng);
@@ -57,7 +63,7 @@ std::vector<T> create_random_data_with_seed(size_t n, size_t max_val,
   } else {
     std::mt19937_64 eng(seed); // a source of random data
 
-    std::uniform_int_distribution<T> dist(0, max_val);
+    std::uniform_int_distribution<T> dist(0, (T)max_val);
     std::vector<T> v(n);
     for (auto &el : v) {
       el = dist(eng);
@@ -76,13 +82,16 @@ template <class T> std::vector<T> create_random_data(size_t n, size_t max_val) {
 template <class T>
 parlay::sequence<T> create_random_data_in_parallel(size_t n, size_t max_val,
                                                    uint64_t seed_add = 0) {
-
+  assert(n < (size_t)std::numeric_limits<T>::max());
+  if (max_val > (size_t)std::numeric_limits<T>::max()) {
+    max_val = (size_t)std::numeric_limits<T>::max();
+  }
   auto v = parlay::sequence<T>::uninitialized(n);
   uint64_t per_worker = (n / ParallelTools::getWorkers()) + 1;
   ParallelTools::parallel_for(0, ParallelTools::getWorkers(), [&](uint64_t i) {
     uint64_t start = i * per_worker;
     uint64_t end = (i + 1) * per_worker;
-    if (end > n) {
+    if (end > n || i == (ParallelTools::getWorkers() - 1UL)) {
       end = n;
     }
     std::random_device rd;
@@ -90,7 +99,7 @@ parlay::sequence<T> create_random_data_in_parallel(size_t n, size_t max_val,
 
     std::uniform_int_distribution<uint64_t> dist(0, max_val);
     for (size_t j = start; j < end; j++) {
-      v[j] = dist(eng);
+      v[j] = (T)dist(eng);
     }
   });
   return v;
@@ -549,7 +558,7 @@ void test_cpma_size_file_out_simple(uint64_t max_size, std::seed_seq &seed,
 
   std::vector<typename traits::key_type> elements =
       create_random_data_with_seed<typename traits::key_type>(
-          max_size, std::min(1UL << 40, max_size), seed);
+          max_size, std::min(1UL << 40U, max_size), seed);
   CPMA<traits> s;
   uint64_t start = get_usecs();
   std::vector<double> sizes(max_size, 0);
@@ -575,7 +584,7 @@ void test_cpma_unordered_insert(uint64_t max_size, std::seed_seq &seed,
       create_random_data_with_seed<typename traits::key_type>(
           max_size * iters,
           std::min(
-              1UL << 40,
+              1UL << 40U,
               (uint64_t)std::numeric_limits<typename traits::key_type>::max()),
           seed);
   uint64_t start = 0;
@@ -610,7 +619,7 @@ void test_tlx_btree_unordered_insert(uint64_t max_size, std::seed_seq &seed,
   }
   std::vector<key_type> data = create_random_data_with_seed<key_type>(
       max_size * iters,
-      std::min(1UL << 40, (uint64_t)std::numeric_limits<key_type>::max()),
+      std::min(1UL << 40U, (uint64_t)std::numeric_limits<key_type>::max()),
       seed);
   uint64_t start = 0;
   uint64_t end = 0;
@@ -637,23 +646,20 @@ void test_tlx_btree_unordered_insert(uint64_t max_size, std::seed_seq &seed,
 }
 
 template <typename T>
-void test_btree_ordered_and_unordered_insert(uint64_t max_size,
+void test_btree_ordered_and_unordered_insert(T max_size,
                                              uint64_t percent_ordered,
                                              std::seed_seq &seed,
                                              uint64_t trials) {
-  if (max_size > std::numeric_limits<T>::max()) {
-    max_size = std::numeric_limits<T>::max();
-  }
 
   std::vector<T> data = create_random_data_with_seed<T>(
-      max_size * trials, std::min(1UL << 40, max_size), seed);
+      (max_size + 1) * trials, std::min(1UL << 40U, (uint64_t)max_size), seed);
   uint64_t start = 0;
   uint64_t end = 0;
   std::vector<uint64_t> times;
   for (uint64_t it = 0; it < trials; it++) {
     tlx::btree_set<T> s;
     start = get_usecs();
-    for (int64_t i = max_size - 1; i >= 0; i--) {
+    for (T i = max_size; i > 0; --i) {
       if (data[it * max_size + i] % 100 < percent_ordered) {
         s.insert(i);
       } else {
@@ -676,23 +682,20 @@ void test_btree_ordered_and_unordered_insert(uint64_t max_size,
 }
 
 template <typename traits>
-void test_cpma_ordered_and_unordered_insert(uint64_t max_size,
+void test_cpma_ordered_and_unordered_insert(typename traits::key_type max_size,
                                             uint64_t percent_ordered,
                                             std::seed_seq &seed,
                                             uint64_t trials) {
-  if (max_size > std::numeric_limits<typename traits::key_type>::max()) {
-    max_size = std::numeric_limits<typename traits::key_type>::max();
-  }
-  std::vector<typename traits::key_type> data =
-      create_random_data_with_seed<typename traits::key_type>(
-          max_size * trials, std::min(1UL << 40, max_size), seed);
+  using T = typename traits::key_type;
+  std::vector<T> data = create_random_data_with_seed<T>(
+      (max_size + 1) * trials, std::min(1UL << 40UL, (uint64_t)max_size), seed);
   uint64_t start = 0;
   uint64_t end = 0;
   std::vector<uint64_t> times;
   for (uint64_t it = 0; it < trials; it++) {
     CPMA<traits> s;
     start = get_usecs();
-    for (int64_t i = max_size - 1; i >= 0; i--) {
+    for (T i = max_size; i > 0; --i) {
       if (data[it * max_size + i] % 100 < percent_ordered) {
         s.insert(i);
       } else {
@@ -712,14 +715,14 @@ void test_cpma_ordered_and_unordered_insert(uint64_t max_size,
   printf("mean time %lu\n", times[trials / 2]);
 }
 
-template <typename T>
-void test_btree_multi_seq_insert(uint64_t max_size, uint64_t groups) {
-  if (max_size > std::numeric_limits<T>::max()) {
-    max_size = std::numeric_limits<T>::max();
-  }
-  uint64_t elements_per_group = max_size / groups;
-  std::vector<uint64_t> group_position(groups);
-  for (uint64_t i = 0; i < groups; i++) {
+template <typename T> void test_btree_multi_seq_insert(T max_size, T groups) {
+
+  T elements_per_group = max_size / groups;
+  uint64_t group_bits = log2_up(groups);
+  uint64_t group_shift = (sizeof(T) * 8) - group_bits;
+  assert(group_bits + log2_up(max_size) < sizeof(T) * 8);
+  std::vector<T> group_position(groups);
+  for (T i = 0; i < groups; ++i) {
     group_position[i] = i;
   }
   std::random_device rd;
@@ -729,9 +732,9 @@ void test_btree_multi_seq_insert(uint64_t max_size, uint64_t groups) {
   uint64_t end = 0;
   tlx::btree_set<T> s;
   start = get_usecs();
-  for (uint32_t i = 0; i < elements_per_group; i++) {
-    for (uint64_t j = 0; j < groups; j++) {
-      s.insert(i + (group_position[j] << 30U));
+  for (T i = 0; i < elements_per_group; ++i) {
+    for (T j = 0; j < groups; ++j) {
+      s.insert(i + (group_position[j] << group_shift));
     }
   }
   end = get_usecs();
@@ -746,13 +749,16 @@ void test_btree_multi_seq_insert(uint64_t max_size, uint64_t groups) {
 }
 
 template <typename traits>
-void test_cpma_multi_seq_insert(uint64_t max_size, uint64_t groups) {
-  if (max_size > std::numeric_limits<typename traits::key_type>::max()) {
-    max_size = std::numeric_limits<typename traits::key_type>::max();
-  }
-  uint64_t elements_per_group = max_size / groups;
-  std::vector<uint64_t> group_position(groups);
-  for (uint64_t i = 0; i < groups; i++) {
+void test_cpma_multi_seq_insert(typename traits::key_type max_size,
+                                typename traits::key_type groups) {
+  using T = typename traits::key_type;
+  T elements_per_group = max_size / groups;
+
+  uint64_t group_bits = log2_up(groups);
+  uint64_t group_shift = (sizeof(T) * 8) - group_bits;
+  assert(group_bits + log2_up(max_size) < sizeof(T) * 8);
+  std::vector<T> group_position(groups);
+  for (T i = 0; i < groups; ++i) {
     group_position[i] = i;
   }
   std::random_device rd;
@@ -762,9 +768,9 @@ void test_cpma_multi_seq_insert(uint64_t max_size, uint64_t groups) {
   uint64_t end = 0;
   CPMA<traits> s;
   start = get_usecs();
-  for (uint32_t i = 0; i < elements_per_group; i++) {
-    for (uint64_t j = 0; j < groups; j++) {
-      s.insert(i + (group_position[j] << 30U));
+  for (T i = 0; i < elements_per_group; ++i) {
+    for (T j = 0; j < groups; ++j) {
+      s.insert(i + (group_position[j] << group_shift));
     }
   }
   end = get_usecs();
@@ -776,14 +782,13 @@ void test_cpma_multi_seq_insert(uint64_t max_size, uint64_t groups) {
   printf("sum_time, %lu, sum_total, %lu\n", end - start, sum);
 }
 
-template <typename T>
-void test_btree_bulk_insert(uint64_t max_size, uint64_t num_per) {
-  if (max_size > std::numeric_limits<T>::max()) {
-    max_size = std::numeric_limits<T>::max();
-  }
-  uint64_t groups = max_size / num_per;
-  std::vector<uint64_t> group_position(groups);
-  for (uint64_t i = 0; i < groups; i++) {
+template <typename T> void test_btree_bulk_insert(T max_size, T num_per) {
+  T groups = max_size / num_per;
+  uint64_t group_bits = log2_up(groups);
+  uint64_t group_shift = (sizeof(T) * 8) - group_bits;
+  assert(group_bits + log2_up(max_size) < sizeof(T) * 8);
+  std::vector<T> group_position(groups);
+  for (T i = 0; i < groups; ++i) {
     group_position[i] = i;
   }
   std::random_device rd;
@@ -793,9 +798,9 @@ void test_btree_bulk_insert(uint64_t max_size, uint64_t num_per) {
   uint64_t end = 0;
   tlx::btree_set<T> s;
   start = get_usecs();
-  for (uint32_t j = 0; j < groups; j++) {
-    for (uint64_t i = 0; i < num_per; i++) {
-      s.insert(i + (group_position[j] << 30U));
+  for (T j = 0; j < groups; ++j) {
+    for (T i = 0; i < num_per; ++i) {
+      s.insert(i + (group_position[j] << group_shift));
     }
   }
   end = get_usecs();
@@ -876,7 +881,7 @@ void test_cpma_unordered_insert_batches(uint64_t max_size,
 template <typename traits>
 void test_cpma_unordered_insert_batches_from_data(
     uint64_t batch_size, std::vector<typename traits::key_type> data,
-    int num_trials, char *filename, char *outfilename) {
+    uint64_t num_trials, char *filename, char *outfilename) {
   uint64_t max_size = data.size();
 
   if (batch_size > max_size) {
@@ -900,7 +905,7 @@ void test_cpma_unordered_insert_batches_from_data(
   uint64_t start = 0;
   uint64_t end = 0;
   uint64_t batch_time = 0;
-  for (int i = 0; i < num_trials; i++) {
+  for (uint64_t i = 0; i < num_trials; i++) {
     CPMA<traits> s;
     start = get_usecs();
     if (batch_size > 1) {
@@ -958,7 +963,7 @@ void test_cpma_unordered_insert_batches_from_data(
   num_trials *= 5; // do more trials for sum
   uint64_t total_time = 0;
 
-  for (int i = 0; i < num_trials; i++) {
+  for (uint64_t i = 0; i < num_trials; i++) {
     uint64_t sum = 0;
     start = get_usecs();
     sum = s.sum();
@@ -1001,6 +1006,7 @@ void test_cpma_unordered_insert_batches_from_data(
 
 template <class pma_type, class set_type>
 bool pma_different_from_set(const pma_type &pma, const set_type &set) {
+  static_assert(pma_type::binary);
   // check that the right data is in the set
   uint64_t correct_sum = 0;
   for (auto e : set) {
@@ -1010,7 +1016,7 @@ bool pma_different_from_set(const pma_type &pma, const set_type &set) {
       return true;
     }
   }
-  bool have_something_wrong = pma.template map<false>([&set](uint64_t element) {
+  bool have_something_wrong = pma.template map<false>([&set](auto element) {
     if (set.find(element) == set.end()) {
       printf("have something (%lu) that the set doesn't have\n",
              (uint64_t)element);
@@ -1315,7 +1321,7 @@ bool verify_cpma(uint64_t number_trials, bool fast = false) {
         break;
       }
       // this is quite slow, but will generate random elements from the set
-      uint32_t steps = dist(eng);
+      uint64_t steps = dist(eng);
       auto it = std::begin(correct);
       std::advance(it, steps);
       if (it == std::end(correct)) {
@@ -1464,7 +1470,7 @@ bool verify_leaf(uint32_t size, uint32_t num_ops, uint32_t range_start,
     if (bit_mask) {
       random_number &= ~bit_mask;
     }
-    uint32_t num = range_start + random_number;
+    uint32_t num = 1 + range_start + random_number;
     if (dist(eng) == 0) {
       if (print) {
         std::cout << "inserting " << num << std::endl;
@@ -1484,7 +1490,7 @@ bool verify_leaf(uint32_t size, uint32_t num_ops, uint32_t range_start,
 
     bool leaf_missing = false;
     for (auto e : correct) {
-      if (leaf.template contains<head_in_place>(e) != true) {
+      if (!leaf.template contains<head_in_place>(e)) {
         std::cout << "leaf is missing " << e << std::endl;
         leaf_missing = true;
       }
@@ -1530,12 +1536,12 @@ bool verify_leaf(uint32_t size, uint32_t num_ops, uint32_t range_start,
   }
 
   std::set<typename leaf_type::key_type> inputs;
-  std::uniform_int_distribution<uint64_t> dist_1000(0, 999);
+  std::uniform_int_distribution<uint64_t> dist_1000(1, 999);
   if (elts_per_leaf > 900) {
     elts_per_leaf = 900;
   }
   while (inputs.size() < elts_per_leaf) {
-    inputs.insert(dist_1000(eng));
+    inputs.insert((typename leaf_type::key_type)dist_1000(eng));
   }
   // std::sort(inputs.begin(), inputs.end());
 
@@ -1547,7 +1553,7 @@ bool verify_leaf(uint32_t size, uint32_t num_ops, uint32_t range_start,
     leaf_type leaf2(heads[i], array + (i * size), size);
 
     for (uint32_t elt : inputs) {
-      uint32_t e = 1000 * i + elt;
+      uint32_t e = 1 + 1000 * i + elt;
       sum += e;
       leaf2.template insert<head_in_place>(e);
     }
@@ -1557,7 +1563,7 @@ bool verify_leaf(uint32_t size, uint32_t num_ops, uint32_t range_start,
   }
   // printf("}\n");
 
-  auto result = leaf_type::template merge<head_in_place, false>(
+  auto result = leaf_type::template merge<head_in_place, false, false>(
       (typename leaf_type::key_type *)array, num_leaves, size, 0,
       [&heads](size_t idx) ->
       typename leaf_type::element_ref_type { return heads[idx]; },
@@ -1578,12 +1584,12 @@ bool verify_leaf(uint32_t size, uint32_t num_ops, uint32_t range_start,
   if (print > 1) {
     result.leaf.print();
   }
-  result.leaf.template split<head_in_place, false>(
+  result.leaf.template split<head_in_place, false, false, false>(
       num_leaves, result.size, size, (typename leaf_type::key_type *)dest_array,
       0,
       [&heads](size_t idx) ->
       typename leaf_type::element_ref_type { return heads[idx]; },
-      nullptr);
+      nullptr, nullptr, num_leaves);
   uint64_t total_sum = 0;
   for (int i = 0; i < num_leaves; i++) {
     leaf_type leaf2(heads[i], dest_array + (i * size), size);
@@ -1704,7 +1710,7 @@ void timing_cpma_helper(uint64_t max_size, uint64_t start_batch_size,
 
 template <class traits>
 bool real_graph(const std::string &filename, int iters = 20,
-                uint32_t start_node = 0, uint32_t max_batch_size = 100000) {
+                uint32_t start_node = 0, uint64_t max_batch_size = 100000) {
   uint32_t num_nodes = 0;
   uint64_t num_edges = 0;
   auto edges = get_edges_from_file_adj_sym(filename, &num_edges, &num_nodes);
@@ -1713,7 +1719,9 @@ bool real_graph(const std::string &filename, int iters = 20,
   CPMA<traits> g;
 
   auto start = get_usecs();
-
+  // for (auto edge : edges) {
+  //   g.insert(edge);
+  // }
   g.insert_batch(edges.data(), edges.size());
   auto end = get_usecs();
   printf("inserting the edges took %lums\n", (end - start) / 1000);
@@ -1761,7 +1769,8 @@ bool real_graph(const std::string &filename, int iters = 20,
     free(parallel_bfs_result);
     parallel_bfs_time2 += (end - start);
   }
-
+  // printf("bfs took %lums, parent of 0 = %d\n", (bfs_time)/(1000*iters),
+  // bfs_result_/iters);
   printf("parallel_bfs with edge_map took %lums, parent of 0 = %d\n",
          parallel_bfs_time2 / (1000 * iters), parallel_bfs_result2_ / iters);
   printf("F-Graph, %d, BFS, %u, %s, ##, %f\n", iters, start_node,
@@ -1869,19 +1878,21 @@ bool real_graph(const std::string &filename, int iters = 20,
   free(values5);
 
   if (true) {
-    for (uint32_t b_size = 10; b_size <= max_batch_size; b_size *= 10) {
+    for (uint64_t b_size = 10; b_size <= max_batch_size; b_size *= 10) {
       auto r = random_aspen(b_size);
       double batch_insert_time = 0;
       double batch_remove_time = 0;
       for (int it = 0; it < iters + 1; it++) {
-
+        // uint64_t size = g.get_memory_size();
+        // printf("size start = %lu\n", size);
         double a = 0.5;
         double b = 0.1;
         double c = 0.1;
         size_t nn = 1UL << (log2_up(num_nodes) - 1);
-        auto rmat = rMat<uint32_t>(nn, r.ith_rand(it), a, b, c);
+        auto rmat =
+            rMat<uint32_t>((uint32_t)nn, (uint32_t)r.ith_rand(it), a, b, c);
         std::vector<uint64_t> es(b_size);
-        ParallelTools::parallel_for(0, b_size, [&](uint32_t i) {
+        ParallelTools::parallel_for(0, b_size, [&](uint64_t i) {
           std::pair<uint32_t, uint32_t> edge = rmat(i);
           es[i] = (static_cast<uint64_t>(edge.first) << 32U) | edge.second;
         });
@@ -1889,6 +1900,7 @@ bool real_graph(const std::string &filename, int iters = 20,
         start = get_usecs();
         g.insert_batch(es.data(), b_size);
         end = get_usecs();
+        // printf("%lu\n", end - start);
         if (it > 0) {
           batch_insert_time += end - start;
         }
@@ -1914,7 +1926,7 @@ bool real_graph(const std::string &filename, int iters = 20,
       // %4.2e "
       //        "updates/second\n",
       //        b_size, batch_remove_time, b_size / (batch_remove_time));
-      printf("%u, %f, %f\n", b_size, batch_insert_time, batch_remove_time);
+      printf("%lu, %f, %f\n", b_size, batch_insert_time, batch_remove_time);
     }
   }
   return true;
@@ -1987,8 +1999,8 @@ bool scan_bench_btree(size_t num_elements, size_t num_bits, size_t iters = 5) {
       }
       uint64_t correct_sum = 0;
       uint64_t serial_start = get_usecs();
-      for (auto it = btree_set.begin(); it != btree_set.end(); it++) {
-        correct_sum += *it;
+      for (const auto &elem : btree_set) {
+        correct_sum += elem;
       }
       uint64_t serial_end = get_usecs();
       iterators[num_partitions] = btree_set.end();
@@ -2005,10 +2017,7 @@ bool scan_bench_btree(size_t num_elements, size_t num_bits, size_t iters = 5) {
       });
       end = get_usecs();
       sum = partial_sums.get();
-      struct key_of_value {
-        static const uint64_t &get(const uint64_t &v) { return v; }
-      };
-      using btree_type = BTree_size_helper<uint64_t, uint64_t, key_of_value>;
+      using btree_type = BTree_size_helper<uint64_t, uint64_t, std::nullptr_t>;
       size_t btree_size =
           btree_set.get_stats().inner_nodes * sizeof(btree_type::InnerNode) +
           btree_set.get_stats().leaves * sizeof(btree_type::LeafNode);
@@ -2031,7 +2040,7 @@ bool scan_bench_btree(size_t num_elements, size_t num_bits, size_t iters = 5) {
 template <typename traits>
 std::tuple<uint64_t, uint64_t>
 batch_test(size_t num_elements_start, size_t batch_size, size_t num_bits = 40,
-           size_t iters = 5, bool verify = false) {
+           size_t iters = 5, bool verify = false, bool insert_sorted = false) {
   uint64_t insert_total = 0;
   uint64_t delete_total = 0;
   for (size_t i = 0; i < iters + 1; i++) {
@@ -2040,6 +2049,12 @@ batch_test(size_t num_elements_start, size_t batch_size, size_t num_bits = 40,
     uint64_t end = 0;
     auto data_start = create_random_data_in_parallel<typename traits::key_type>(
         num_elements_start, 1UL << num_bits);
+
+    if (insert_sorted) {
+      ParallelTools::parallel_for(0, num_elements_start, [&](size_t j) {
+        data_start[j] += num_elements_start + 1;
+      });
+    }
 
     tlx::btree_set<typename traits::key_type> correct;
     if (verify) {
@@ -2054,8 +2069,12 @@ batch_test(size_t num_elements_start, size_t batch_size, size_t num_bits = 40,
     search_cnt.reset();
     search_steps_cnt.reset();
     auto data_batches =
-        create_random_data_in_parallel<typename traits::key_type>(
-            num_elements_start, 1UL << num_bits, 1000);
+        (insert_sorted)
+            ? parlay::tabulate<typename traits::key_type>(
+                  num_elements_start,
+                  [&](size_t j) { return num_elements_start - j; })
+            : create_random_data_in_parallel<typename traits::key_type>(
+                  num_elements_start, 1UL << num_bits, 1000);
     if (verify) {
       correct.insert(data_batches.begin(), data_batches.end());
     }
@@ -2084,17 +2103,17 @@ batch_test(size_t num_elements_start, size_t batch_size, size_t num_bits = 40,
         return {-1UL, -1UL};
       }
     }
-    std::random_device rd;
-    std::mt19937 g(rd());
-    auto delete_batch = parlay::random_shuffle(data_batches, rd());
+    // std::random_device rd;
+    // std::mt19937 g(rd());
+    // auto delete_batch = parlay::random_shuffle(data_batches, rd());
 
-    start = get_usecs();
-    for (auto *batch_start = delete_batch.data();
-         batch_start < delete_batch.data() + delete_batch.size();
-         batch_start += batch_size) {
-      pma.remove_batch(batch_start, batch_size);
-    }
-    end = get_usecs();
+    // start = get_usecs();
+    // for (auto *batch_start = delete_batch.data();
+    //      batch_start < delete_batch.data() + delete_batch.size();
+    //      batch_start += batch_size) {
+    //   pma.remove_batch(batch_start, batch_size);
+    // }
+    // end = get_usecs();
     if (i > 0) {
       delete_total += end - start;
     }
@@ -2150,22 +2169,31 @@ double build_by_batch_for_time(size_t total_elements, size_t batch_size,
 
 template <typename traits>
 bool batch_bench(size_t num_elements_start, size_t num_bits = 40,
-                 size_t iters = 5, bool verify = false) {
+                 size_t iters = 5, bool verify = false,
+                 bool insert_sorted = false) {
+  if (num_elements_start >=
+      (uint64_t)std::numeric_limits<typename traits::key_type>::max()) {
+    return false;
+  }
   std::map<size_t, uint64_t> insert_total;
   std::map<size_t, uint64_t> delete_total;
 
   for (size_t batch_size = 1; batch_size < num_elements_start;
        batch_size *= 10) {
+    if (num_elements_start + batch_size >
+        (uint64_t)std::numeric_limits<typename traits::key_type>::max()) {
+      break;
+    }
     auto results = batch_test<traits>(num_elements_start, batch_size, num_bits,
-                                      iters, verify);
+                                      iters, verify, insert_sorted);
     insert_total[batch_size] = std::get<0>(results);
     delete_total[batch_size] = std::get<1>(results);
   }
 
   for (size_t batch_size = 1; batch_size < num_elements_start;
        batch_size *= 10) {
-    printf("%lu, %lu, %lu\n", batch_size, insert_total[batch_size] / iters,
-           delete_total[batch_size] / iters);
+    printf("%lu, %lu, %lu\n", batch_size, insert_total[batch_size],
+           delete_total[batch_size]);
   }
   return false;
 }
@@ -2189,7 +2217,7 @@ void map_range(const Set &set, F f, key_type s, key_type t) {
 
 template <class Set>
 void map_range_test(size_t num_elements_start, uint64_t num_ranges,
-                    uint64_t size_of_range, size_t num_bits,
+                    typename Set::key_type size_of_range, size_t num_bits,
                     std::seed_seq &seed1, std::seed_seq &seed2) {
   using T = typename Set::key_type;
   auto data_to_insert = create_random_data_with_seed<T>(num_elements_start,
@@ -2198,7 +2226,7 @@ void map_range_test(size_t num_elements_start, uint64_t num_ranges,
   ParallelTools::Reducer_sum<uint64_t> sum_of_counts;
   ParallelTools::Reducer_sum<uint64_t> sum_of_vals;
 
-  auto range_starts = create_random_data_with_seed<uint64_t>(
+  auto range_starts = create_random_data_with_seed<T>(
       num_ranges, (1UL << num_bits) - size_of_range, seed2);
   uint64_t start = get_usecs();
   ParallelTools::parallel_for(0, num_ranges, [&](uint64_t i) {
@@ -2210,20 +2238,22 @@ void map_range_test(size_t num_elements_start, uint64_t num_ranges,
           num_in_range += 1;
           sum_in_range += el;
         },
-        range_starts[i], range_starts[i] + size_of_range);
+        range_starts[i], (T)(range_starts[i] + size_of_range));
     sum_of_counts.add(num_in_range);
     sum_of_vals.add(sum_in_range);
   });
   uint64_t end = get_usecs();
   printf("the sum of the counts from the ranges was %lu took %lu "
          "range_size was %lu, sum of elements was %lu\n",
-         sum_of_counts.get(), end - start, size_of_range, sum_of_vals.get());
+         sum_of_counts.get(), end - start, (uint64_t)size_of_range,
+         sum_of_vals.get());
 }
 
 template <class Set>
 bool map_range_single(size_t num_elements_start, uint64_t num_ranges,
-                      uint64_t size_of_range, size_t num_bits, size_t iters,
-                      std::seed_seq &seed1, std::seed_seq &seed2) {
+                      typename Set::key_type size_of_range, size_t num_bits,
+                      size_t iters, std::seed_seq &seed1,
+                      std::seed_seq &seed2) {
   using T = typename Set::key_type;
   std::vector<uint64_t> times;
   auto data_to_insert = create_random_data_with_seed<T>(
@@ -2235,7 +2265,7 @@ bool map_range_single(size_t num_elements_start, uint64_t num_ranges,
     uint64_t end = 0;
     Set s(data_to_insert.data() + (it * num_elements_start),
           data_to_insert.data() + ((it + 1) * num_elements_start));
-    auto range_starts = create_random_data_with_seed<uint64_t>(
+    auto range_starts = create_random_data_with_seed<T>(
         num_ranges, (1UL << num_bits) - size_of_range, seed2);
     ParallelTools::Reducer_sum<uint64_t> sum_of_counts;
     ParallelTools::Reducer_sum<uint64_t> sum_of_vals;
@@ -2249,21 +2279,22 @@ bool map_range_single(size_t num_elements_start, uint64_t num_ranges,
             num_in_range += 1;
             sum_in_range += el;
           },
-          range_starts[i], range_starts[i] + size_of_range);
+          range_starts[i], (T)(range_starts[i] + size_of_range));
       sum_of_counts.add(num_in_range);
       sum_of_vals.add(sum_in_range);
     });
     end = get_usecs();
     printf("the sum of the counts from the ranges was %lu took %lu "
            "range_size was %lu, sum of elements was %lu\n",
-           sum_of_counts.get(), end - start, size_of_range, sum_of_vals.get());
+           sum_of_counts.get(), end - start, (uint64_t)size_of_range,
+           sum_of_vals.get());
     times.push_back(end - start);
   }
   uint64_t total_time = 0;
   for (uint64_t j = 1; j <= iters; j++) {
     total_time += times[j];
   }
-  printf("for size %lu, mean time was %f\n", size_of_range,
+  printf("for size %lu, mean time was %f\n", (uint64_t)size_of_range,
          ((double)total_time) / (iters * 1000000));
   return true;
 }
@@ -2285,8 +2316,12 @@ bool map_range_bench(size_t num_elements_start, uint64_t num_ranges,
           data_to_insert.data() + ((it + 1) * num_elements_start));
     uint64_t log_size_of_range = 0;
     while (log_size_of_range < num_sizes) {
-      uint64_t size_of_range = 1UL << log_size_of_range;
-      auto range_starts = create_random_data_with_seed<uint64_t>(
+      uint64_t size_of_rangeL = 1UL << log_size_of_range;
+      if (size_of_rangeL > std::numeric_limits<T>::max()) {
+        break;
+      }
+      T size_of_range = (T)size_of_rangeL;
+      auto range_starts = create_random_data_with_seed<T>(
           num_ranges, (1UL << num_bits) - size_of_range, seed2);
       ParallelTools::Reducer_sum<uint64_t> sum_of_counts;
       ParallelTools::Reducer_sum<uint64_t> sum_of_vals;
@@ -2300,14 +2335,14 @@ bool map_range_bench(size_t num_elements_start, uint64_t num_ranges,
               num_in_range += 1;
               sum_in_range += el;
             },
-            range_starts[i], range_starts[i] + size_of_range);
+            range_starts[i], (T)(range_starts[i] + size_of_range));
         sum_of_counts.add(num_in_range);
         sum_of_vals.add(sum_in_range);
       });
       end = get_usecs();
       printf("the sum of the counts from the ranges was %lu took %lu "
              "range_size was %lu, sum of elements was %lu\n",
-             sum_of_counts.get(), end - start, size_of_range,
+             sum_of_counts.get(), end - start, (uint64_t)size_of_range,
              sum_of_vals.get());
       times[log_size_of_range].push_back(end - start);
       log_size_of_range += 1UL;
@@ -2315,6 +2350,9 @@ bool map_range_bench(size_t num_elements_start, uint64_t num_ranges,
   }
   for (uint64_t i = 0; i < num_sizes; i++) {
     uint64_t total_time = 0;
+    if (times[i].empty()) {
+      continue;
+    }
     for (uint64_t j = 1; j <= iters; j++) {
       total_time += times[i][j];
     }
@@ -2334,14 +2372,20 @@ bool find_bench(size_t num_elements_start, uint64_t num_searches,
     uint64_t end = 0;
     std::random_device rd1;
     std::seed_seq seed1{rd1()};
-
+    // auto data_to_insert = create_random_data<uint64_t>(num_elements_start,
+    //                                                    1UL << num_bits,
+    //                                                    seed1);
     auto data_to_insert =
         create_random_data_in_parallel<typename traits::key_type>(
             num_elements_start, 1UL << num_bits);
 
+    // std::random_device rd2;
+    // std::seed_seq seed2{rd2()};
+    // auto data_to_search =
+    //     create_random_data<uint64_t>(num_searches, 1UL << num_bits, seed2);
     auto data_to_search =
         create_random_data_in_parallel<typename traits::key_type>(
-            num_searches, 1UL << num_bits, num_elements_start);
+            num_searches, 1UL << num_bits);
     std::unordered_set<uint64_t> correct;
     uint64_t correct_num_contains = 0;
     if (verify) {
@@ -2395,12 +2439,18 @@ bool find_bench_tlx_btree(size_t num_elements_start, uint64_t num_searches,
     uint64_t end;
     std::random_device rd1;
     std::seed_seq seed1{rd1()};
-
+    // auto data_to_insert = create_random_data<uint64_t>(num_elements_start,
+    //                                                    1UL << num_bits,
+    //                                                    seed1);
     auto data_to_insert = create_random_data_in_parallel<uint64_t>(
         num_elements_start, 1UL << num_bits);
 
-    auto data_to_search = create_random_data_in_parallel<uint64_t>(
-        num_searches, 1UL << num_bits, num_elements_start);
+    // std::random_device rd2;
+    // std::seed_seq seed2{rd2()};
+    // auto data_to_search =
+    //     create_random_data<uint64_t>(num_searches, 1UL << num_bits, seed2);
+    auto data_to_search =
+        create_random_data_in_parallel<uint64_t>(num_searches, 1UL << num_bits);
     std::unordered_set<uint64_t> correct;
     uint64_t correct_num_contains = 0;
     if (verify) {
@@ -2412,9 +2462,11 @@ bool find_bench_tlx_btree(size_t num_elements_start, uint64_t num_searches,
       correct_num_contains = number_contains.get();
     }
     {
+      // std::sort(data_to_insert.begin(), data_to_insert.end());
 
       tlx::btree_set<uint64_t> btree_set;
 
+      // btree_set.bulk_load(data_to_insert.begin(), data_to_insert.end());
       for (const auto &el : data_to_insert) {
         btree_set.insert(el);
       }
@@ -2430,10 +2482,8 @@ bool find_bench_tlx_btree(size_t num_elements_start, uint64_t num_searches,
       uncompressed_find_times.push_back(end - start);
 
       if (!verify) {
-        struct key_of_value {
-          static const uint64_t &get(const uint64_t &v) { return v; }
-        };
-        using btree_type = BTree_size_helper<uint64_t, uint64_t, key_of_value>;
+        using btree_type =
+            BTree_size_helper<uint64_t, uint64_t, std::nullptr_t>;
         size_t btree_size =
             btree_set.get_stats().inner_nodes * sizeof(btree_type::InnerNode) +
             btree_set.get_stats().leaves * sizeof(btree_type::LeafNode);
@@ -2509,4 +2559,202 @@ void ycsb_scan_bench(std::vector<typename Set::key_type> values,
   }
   uint64_t end = get_usecs();
   printf("total sum was %lu in %lu microseconds\n", total_sum, end - start);
+}
+
+template <class Set>
+void simple_rank_test(uint64_t num_elements, uint64_t batch_size = 1) {
+  std::vector<typename Set::key_type> values(num_elements);
+  for (uint64_t i = 0; i < num_elements; i++) {
+    values[i] = i + 1;
+  }
+  std::random_device rd;
+  std::mt19937 g(0);
+  // std::mt19937 g(rd());
+  std::shuffle(values.begin(), values.end(), g);
+  Set s;
+  uint64_t start = get_usecs();
+  if (batch_size == 1) {
+    for (auto v : values) {
+      s.insert(v);
+    }
+  } else {
+    uint64_t index = 0;
+    while (index + batch_size < values.size()) {
+      s.insert_batch(values.data() + index, batch_size);
+      index += batch_size;
+    }
+    s.insert_batch(values.data() + index, values.size() - index);
+  }
+  uint64_t end = get_usecs();
+  printf("inserting the elements keeping track of the ranks took %lu\n",
+         end - start);
+  start = get_usecs();
+  for (auto v : values) {
+    uint64_t rank = s.rank(v);
+    if (rank != v - 1) {
+      printf("got the wrong rank, element %lu, got rank %lu\n", (uint64_t)v,
+             rank);
+    }
+  }
+  end = get_usecs();
+  printf("getting the rank of each element took %lu\n", end - start);
+  // s.print_pma();
+
+  start = get_usecs();
+  for (auto v : values) {
+    auto el = s.select(v - 1);
+    if (el != v) {
+      printf("got the wrong element, index %lu, got element %lu\n",
+             (uint64_t)v - 1, (uint64_t)el);
+    }
+  }
+  end = get_usecs();
+  printf("selecting the elements by rank took %lu\n", end - start);
+  // s.print_pma();
+}
+
+template <class Set> void simple_rank_insert_test(uint64_t num_elements) {
+  std::vector<typename Set::key_type> values(num_elements);
+  for (uint64_t i = 0; i < num_elements; i++) {
+    values[i] = i + 1;
+  }
+  std::random_device rd;
+  std::mt19937 g(0);
+  // std::mt19937 g(rd());
+  std::shuffle(values.begin(), values.end(), g);
+  Set pma;
+  std::vector<uint64_t> correct;
+
+  uint64_t start = get_usecs();
+  for (auto v : values) {
+    uint64_t rank = g() % (correct.size() + 1);
+    // printf("inserting %lu into position %lu\n", v, rank);
+    pma.insert_by_rank(v, rank);
+    correct.insert(correct.begin() + rank, v);
+    // pma.print_pma();
+  }
+  uint64_t end = get_usecs();
+  printf("inserting the elements by ranks took %lu\n", end - start);
+
+  uint64_t counter = 0;
+  pma.template map<true>([&counter, &correct](uint64_t element) {
+    if (element != correct[counter++]) {
+      printf("something is in the wrong position\n");
+    }
+  });
+
+  // pma.print_pma();
+  // std::cout << "correct vector:";
+  // for (auto el : correct) {
+  //   std::cout << el << ",";
+  // }
+  // std::cout << "\n";
+}
+/*
+void simple_key_value_test(uint64_t num_elements) {
+  auto keys = create_random_data<uint64_t>(
+      num_elements, std::numeric_limits<uint64_t>::max() - 1);
+  auto values = create_random_data<uint32_t>(
+      num_elements, std::numeric_limits<uint32_t>::max() - 1);
+
+  PMAkv<uint64_t, uint32_t> test;
+  uint64_t unique = 0;
+  uint64_t start = get_usecs();
+  for (uint64_t i = 0; i < num_elements; i++) {
+    unique += test.insert_or_update(keys[i], values[i]);
+  }
+  uint64_t end = get_usecs();
+  printf("inserting the elements took %lu, %lu unique\n", end - start, unique);
+  uint64_t found = 0;
+  start = get_usecs();
+
+  for (uint64_t i = 0; i < num_elements; i++) {
+    auto [had, val] = test.get(keys[i]);
+    if (had) {
+      found += val == values[i];
+    }
+  }
+  end = get_usecs();
+  printf("finding the elements took %lu, %lu found\n", end - start, found);
+}
+
+void simple_key_value_test_map(uint64_t num_elements) {
+  auto keys = create_random_data<uint64_t>(
+      num_elements, std::numeric_limits<uint64_t>::max() - 1);
+  auto values = create_random_data<uint32_t>(
+      num_elements, std::numeric_limits<uint32_t>::max() - 1);
+
+  tlx::btree_map<uint64_t, uint32_t> test;
+  uint64_t unique = 0;
+  uint64_t start = get_usecs();
+  for (uint64_t i = 0; i < num_elements; i++) {
+    // auto p = test.insert_or_assign(keys[i], values[i]);
+    // unique += p.second;
+    test[keys[i]] = values[i];
+  }
+  uint64_t end = get_usecs();
+  printf("inserting the elements took %lu, %lu unique\n", end - start, unique);
+  uint64_t found = 0;
+  start = get_usecs();
+
+  for (uint64_t i = 0; i < num_elements; i++) {
+    auto it = test.find(keys[i]);
+    if (it != test.end()) {
+      found += (*it).second == values[i];
+    }
+  }
+  end = get_usecs();
+  printf("finding the elements took %lu, %lu found\n", end - start, found);
+}
+*/
+
+template <typename traits>
+void growing_factor_analysis_with_batches(uint64_t num_batches,
+                                          uint64_t batch_size, bool do_sums,
+                                          char *output_filename,
+                                          uint64_t trials = 10,
+                                          uint64_t max_val = 1UL << 40U) {
+  uint64_t total_elements = num_batches * batch_size;
+  std::vector<double> sizes(num_batches);
+  std::vector<uint64_t> sum_times(num_batches);
+  std::vector<typename traits::key_type> sums(num_batches);
+  uint64_t total_time = 0;
+  for (uint64_t trial = 0; trial < trials; trial++) {
+    auto elements_to_insert =
+        create_random_data<typename traits::key_type>(total_elements, max_val);
+
+    uint64_t insert_start_time = get_usecs();
+    CPMA<traits> pma;
+    for (uint64_t i = 0; i < total_elements; i += batch_size) {
+      pma.insert_batch(elements_to_insert.data() + i, batch_size);
+      sizes[i / batch_size] += ((double)pma.get_size()) / (i + batch_size);
+      if (do_sums) {
+        uint64_t sum_start_time = get_usecs();
+        sums[i / batch_size] += pma.sum();
+        uint64_t sum_end_time = get_usecs();
+        sum_times[i / batch_size] += sum_end_time - sum_start_time;
+      }
+    }
+    uint64_t insert_end_time = get_usecs();
+    total_time += insert_end_time - insert_start_time;
+  }
+
+  std::ofstream myfile;
+  myfile.open(output_filename);
+  myfile << "batch number, size_per_element, sum_time_per_element\n";
+  uint64_t total_sum_time = 0;
+  typename traits::key_type total_sum = 0;
+  for (uint32_t i = 0; i < num_batches; i++) {
+    myfile << i << ", " << sizes[i] / trials << ", "
+           << ((double)sum_times[i]) / ((i + 1) * batch_size * trials) << "\n";
+    total_sum_time += sum_times[i] / trials;
+    total_sum += sums[i];
+  }
+
+  total_time /= trials;
+
+  myfile.close();
+  printf("insert time = %lu, total time = %lu\n", total_time - total_sum_time,
+         total_time);
+  std::cout << "total sum = " << total_sum << "\n";
 }

@@ -13,6 +13,9 @@
 -march=native
 -IParallelTools/
 -Iparlaylib/include/
+-Iinclude/
+-IEdgeMapVertexMap/include/
+-IStructOfArrays/include/
 -Itlx/
 -DCILK=0
 -DPARALLEL=0

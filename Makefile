@@ -22,14 +22,14 @@ $(warning sorting and thus batch inserts is much faster with vqsort)
 endif
 
 
-CFLAGS := -Wall -Wextra -O$(OPT)  -std=c++20 -IParallelTools/ -Itlx/ -Wno-deprecated-declarations -Iparlaylib/include/ -ferror-limit=1 -Wshadow
+CFLAGS := -Wall -Wextra -O$(OPT)  -std=c++20 -Iinclude -IParallelTools/ -Itlx/ -Wno-deprecated-declarations -Iparlaylib/include/ -IStructOfArrays/include/ -IEdgeMapVertexMap/include/ -ferror-limit=1 -Wshadow
 
 ifeq ($(DEBUG_SYMBOLS),1)
 CFLAGS += -g -gdwarf-4
 endif
 
 ifeq ($(EXTRA_WARNINGS),1)
-CFLAGS += -Weverything -Wno-c++98-compat -Wno-c++98-compat-pedantic -Wno-old-style-cast -Wno-implicit-int-float-conversion -Wno-missing-prototypes -Wno-sign-conversion -Wno-float-conversion -Wno-missing-variable-declarations -Wno-exit-time-destructors
+CFLAGS += -Weverything -Wno-c++98-compat -Wno-c++98-compat-pedantic -Wno-old-style-cast -Wno-implicit-int-float-conversion -Wno-missing-prototypes -Wno-sign-conversion -Wno-float-conversion -Wno-missing-variable-declarations -Wno-exit-time-destructors -Wno-cast-align -Wno-ctad-maybe-unsupported
 endif
 
 ifeq ($(SANITIZE),1)
@@ -84,13 +84,24 @@ endif
 
 define get_build_rule
 
-build/basic_$(1)_$(2)_$(3): run.cpp test.hpp leaf.hpp CPMA.hpp
+build/basic_$(1)_$(2)_$(3): run.cpp include/PMA/internal/test.hpp include/PMA/internal/leaf.hpp include/PMA/CPMA.hpp
 	@mkdir -p build
 	$(CXX) $(CFLAGS) $(DEFINES) -DKEY_TYPE=$(1) -DLEAFFORM=$(2) -DHEADFORM=$(3)  $(LDFLAGS) -o build/basic_$(1)_$(2)_$(3) run.cpp
 endef
 
 define get_build_rule_name
 build/basic_$(1)_$(2)_$(3)
+endef
+
+define get_build_soa_rule
+
+build/basic_soa_$(1)_$(2): run_soa.cpp include/PMA/internal/test_map.hpp include/PMA/internal/leaf.hpp include/PMA/CPMA.hpp
+	@mkdir -p build
+	$(CXX) $(CFLAGS) $(DEFINES) -DKEY_TYPE=$(1) -DHEADFORM=$(2)  $(LDFLAGS) -o build/basic_soa_$(1)_$(2) run_soa.cpp
+endef
+
+define get_build_soa_rule_name
+build/basic_soa_$(1)_$(2)
 endef
 
 define get_test_rule
@@ -104,6 +115,7 @@ test_out/basic_$(1)_$(2)_$(3)/v_leaf: build/basic_$(1)_$(2)_$(3)
 test_out/basic_$(1)_$(2)_$(3)/v_batch: build/basic_$(1)_$(2)_$(3)
 	@mkdir -p test_out/basic_$(1)_$(2)_$(3)
 	@stdbuf --output=L ./build/basic_$(1)_$(2)_$(3) v_batch > test_out/basic_$(1)_$(2)_$(3)/v_batch_  || (echo "verification test_batch failed $$?"; echo "run with ./build/basic_$(1)_$(2)_$(3) v_batch"; exit 1)
+	@stdbuf --output=L ./build/basic_$(1)_$(2)_$(3) v_batch 100000 1 >> test_out/basic_$(1)_$(2)_$(3)/v_batch_  || (echo "verification test_batch sorted failed $$?"; echo "run with ./build/basic_$(1)_$(2)_$(3) v_batch  100000 1"; exit 1)
 	@mv test_out/basic_$(1)_$(2)_$(3)/v_batch_ test_out/basic_$(1)_$(2)_$(3)/v_batch
 	@echo "test batch passed for " build/basic_$(1)_$(2)_$(3)
 
@@ -121,8 +133,25 @@ define get_test_rule_name
 test_out/basic_$(1)_$(2)_$(3)/test
 endef
 
+define get_test_soa_rule
 
-all: basic   
+test_out/basic_soa_$(1)_$(2)/verify: build/basic_soa_$(1)_$(2)
+	@mkdir -p test_out/basic_soa_$(1)_$(2)
+	@stdbuf --output=L ./build/basic_soa_$(1)_$(2) verify > test_out/basic_soa_$(1)_$(2)/verify_  || (echo "verification test verify failed $$?"; echo "run with ./build/basic_soa_$(1)_$(2) verify"; exit 1)
+	@mv test_out/basic_soa_$(1)_$(2)/verify_ test_out/basic_soa_$(1)_$(2)/verify
+	@echo "test verify passed for " build/basic_soa_$(1)_$(2)
+
+test_out/basic_soa_$(1)_$(2)/test: test_out/basic_soa_$(1)_$(2)/verify
+	@touch test_out/basic_soa_$(1)_$(2)/test
+
+endef
+
+define get_test_soa_rule_name
+test_out/basic_soa_$(1)_$(2)/test
+endef
+
+
+all: basic
 
 head_forms := InPlace Linear Eytzinger BNary
 key_types := uint32_t uint64_t
@@ -140,11 +169,18 @@ $(foreach key_type,$(key_types2),$(foreach head_form,$(head_forms),$(eval $(call
 $(foreach key_type,$(key_types2),$(foreach head_form,$(head_forms),$(eval $(call get_test_rule,$(key_type),uncompressed,$(head_form)))))
 
 
+# key values stores do all the key sizes, but don't do compression
+key_types3 := uint16_t uint24_t uint32_t uint64_t
+
+$(foreach key_type,$(key_types3),$(foreach head_form,$(head_forms),$(eval $(call get_build_soa_rule,$(key_type),$(head_form)))))
+
+$(foreach key_type,$(key_types3),$(foreach head_form,$(head_forms),$(eval $(call get_test_soa_rule,$(key_type),$(head_form)))))
 
 
-basic : $(foreach leaf_form,$(leaf_forms),$(foreach key_type,$(key_types),$(foreach head_form,$(head_forms),$(call get_build_rule_name,$(key_type),$(leaf_form),$(head_form))))) $(foreach key_type,$(key_types2),$(foreach head_form,$(head_forms),$(call get_build_rule_name,$(key_type),uncompressed,$(head_form))))
 
-test : $(foreach leaf_form,$(leaf_forms),$(foreach key_type,$(key_types),$(foreach head_form,$(head_forms),$(call get_test_rule_name,$(key_type),$(leaf_form),$(head_form))))) $(foreach key_type,$(key_types2),$(foreach head_form,$(head_forms),$(call get_test_rule_name,$(key_type),uncompressed,$(head_form))))
+basic : $(foreach leaf_form,$(leaf_forms),$(foreach key_type,$(key_types),$(foreach head_form,$(head_forms),$(call get_build_rule_name,$(key_type),$(leaf_form),$(head_form))))) $(foreach key_type,$(key_types2),$(foreach head_form,$(head_forms),$(call get_build_rule_name,$(key_type),uncompressed,$(head_form)))) $(foreach key_type,$(key_types3),$(foreach head_form,$(head_forms),$(call get_build_soa_rule_name,$(key_type),$(head_form)))) 
+
+test : $(foreach leaf_form,$(leaf_forms),$(foreach key_type,$(key_types),$(foreach head_form,$(head_forms),$(call get_test_rule_name,$(key_type),$(leaf_form),$(head_form))))) $(foreach key_type,$(key_types2),$(foreach head_form,$(head_forms),$(call get_test_rule_name,$(key_type),uncompressed,$(head_form)))) $(foreach key_type,$(key_types3),$(foreach head_form,$(head_forms),$(call get_test_soa_rule_name,$(key_type),$(head_form))))
 
 
 soa : run_soa.cpp leaf.hpp CPMA.hpp StructOfArrays/soa.hpp
