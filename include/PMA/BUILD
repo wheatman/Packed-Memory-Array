@@ -1,6 +1,6 @@
 cc_library(
     name = "cpma",
-    hdrs = ["cpma.hpp"],
+    hdrs = ["CPMA.hpp"],
     deps = [
         "//PMA/internal:helpers",
         "//PMA/internal:timers",

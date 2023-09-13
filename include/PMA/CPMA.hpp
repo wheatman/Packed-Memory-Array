@@ -4672,11 +4672,14 @@ void CPMA<traits>::serial_map_with_hint(
     if (*it >= end_key) {
       return;
     }
-    if (f(*it)) {
-      if constexpr (!no_early_exit) {
-        return;
+    if constexpr (no_early_exit) {
+      f(*it);
+    } else {
+      if (f(*it)) {
+          return;
       }
     }
+
   }
 }
 
@@ -4695,9 +4698,11 @@ void CPMA<traits>::serial_map_with_hint_par(
     if (*it >= end_key) {
       return;
     }
-    if (f(*it)) {
-      if constexpr (!no_early_exit) {
-        return;
+    if constexpr (no_early_exit) {
+      f(*it);
+    } else {
+      if (f(*it)) {
+          return;
       }
     }
   }
