@@ -467,14 +467,14 @@ private:
     set_out_of_place_temp_size(T_array(), size);
   }
 
-  void slide_right(const uint8_t *loc, uint64_t amount) {
+  void slide_right(uint8_t *loc, uint64_t amount) {
     assert(amount <= max_element_size);
     std::memmove((void *)(loc + amount), (void *)loc,
                  length_in_bytes - (loc + amount - array));
     // std::memset((void *)loc, 0, amount);
   }
 
-  void slide_left(const uint8_t *loc, uint64_t amount) {
+  void slide_left(uint8_t *loc, uint64_t amount) {
     assert(amount <= max_element_size);
     std::memmove((void *)(loc - amount), (void *)loc,
                  length_in_bytes - (loc + amount - array));

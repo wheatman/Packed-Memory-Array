@@ -98,8 +98,6 @@ public:
 };
 } // namespace std
 
-#define intT int32_t
-#define uintT uint32_t
 
 // find index of first 1-bit (least significant bit)
 static inline uint32_t bsf_word(uint32_t word) {

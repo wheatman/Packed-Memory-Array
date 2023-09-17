@@ -993,7 +993,81 @@ public:
   bool check_nothing_full();
   static constexpr bool compressed = leaf::compressed;
   explicit CPMA();
-  CPMA(const CPMA &source);
+  // Move constructor
+  CPMA(CPMA &&other) noexcept : meta_data_index(other.meta_data_index), has_0(other.has_0), count_elements_(other.count_elements_), underlying_array(other.underlying_array) {
+    other.count_elements_ = 0;
+    other.meta_data_index = 0;
+    other.has_0 = false;
+    if constexpr (!fixed_size) {
+      other.underlying_array = nullptr;
+    }
+#if VQSORT == 1
+    sorter = other.sorter;
+#endif
+  }
+  // Copy constructor
+  CPMA(const CPMA &other) noexcept : meta_data_index(other.meta_data_index), has_0(other.has_0), count_elements_(other.count_elements_) {
+    if constexpr (fixed_size) {
+      underlying_array = other.underlying_array;
+    } else {
+      uint64_t allocated_size = other.underlying_array_size() + 32;
+      if (allocated_size % 32 != 0) {
+        allocated_size += 32 - (allocated_size % 32);
+      }
+      underlying_array = aligned_alloc(32, allocated_size);
+      ParallelTools::parallel_for(0, other.underlying_array_size(), [&](size_t i) {
+        underlying_array[i] = other.underlying_array[i];
+      });
+    }
+#if VQSORT == 1
+    sorter = other.sorter;
+#endif
+  }
+//   // Move assignment
+  CPMA &operator=(CPMA &&other) noexcept {
+    if (this == &other) {
+      return *this;
+    }
+    count_elements_ = other.count_elements_;
+    other.count_elements_ = 0;
+    meta_data_index = other.meta_data_index;
+    other.meta_data_index = 0;
+    has_0 = other.has_0;
+    other.has_0 = false;
+    underlying_array = other.underlying_array;
+    if constexpr (!fixed_size) {
+      other.underlying_array = nullptr;
+    }
+#if VQSORT == 1
+    sorter = other.sorter;
+#endif
+    return *this;
+  }
+  // copy assignment
+  CPMA &operator=(const CPMA &other) noexcept {
+    if (this == &other) {
+      return *this;
+    }
+    count_elements_ = other.count_elements_;
+    meta_data_index = other.meta_data_index;
+    has_0 = other.has_0;
+    if constexpr (fixed_size) {
+      underlying_array = other.underlying_array;
+    } else {
+      uint64_t allocated_size = other.underlying_array_size() + 32;
+      if (allocated_size % 32 != 0) {
+        allocated_size += 32 - (allocated_size % 32);
+      }
+      underlying_array = aligned_alloc(32, allocated_size);
+      ParallelTools::parallel_for(0, other.underlying_array_size(), [&](size_t i) {
+        underlying_array_char()[i] = other.underlying_array_char()[i];
+      });
+    }
+#if VQSORT == 1
+    sorter = other.sorter;
+#endif
+    return *this;
+  }
   CPMA(key_type *start, key_type *end);
   ~CPMA() {
     if constexpr (!fixed_size) {
@@ -1083,6 +1157,7 @@ public:
   }
 
   template <bool no_early_exit, class F> bool map(F f) const;
+  template <class F> bool parallel_map(F f) const;
 
   template <bool no_early_exit, class F>
   void serial_map_with_hint(F f, key_type end_key,
@@ -2007,22 +2082,6 @@ template <typename traits> CPMA<traits>::CPMA(key_type *start, key_type *end) {
   std::fill((uint8_t *)underlying_array,
             (uint8_t *)underlying_array + underlying_array_size(), 0);
   insert_batch(start, end - start);
-}
-
-template <typename traits>
-CPMA<traits>::CPMA(const CPMA<traits> &source)
-    : meta_data_index(source.meta_data_index), has_0(source.has_0) {
-  if constexpr (!fixed_size) {
-    uint64_t allocated_size = underlying_array_size() + 32;
-    if (allocated_size % 32 != 0) {
-      allocated_size += 32 - (allocated_size % 32);
-    }
-    underlying_array = aligned_alloc(32, allocated_size);
-  }
-  // TODO(wheatman) parallel copy
-  std::copy(source.underlying_array,
-            source.underlying_array + underlying_array_size(),
-            underlying_array);
 }
 
 template <typename traits> bool CPMA<traits>::has(key_type e) const {
@@ -3417,6 +3476,7 @@ uint64_t CPMA<traits>::insert_batch(element_ptr_type e, uint64_t batch_size) {
   sort_timer.start();
   sort_batch(e, batch_size);
   sort_timer.stop();
+  bool inserted_zero = false;
 
   // TODO(wheatman) currently only works for unsigned types
   while (e.get() == 0) {
@@ -3426,13 +3486,14 @@ uint64_t CPMA<traits>::insert_batch(element_ptr_type e, uint64_t batch_size) {
       }
     } else {
       get_data_ref(-1) = e[0];
+      inserted_zero = true;
     }
     has_0 = true;
 
     ++e;
     batch_size -= 1;
     if (batch_size == 0) {
-      return 0;
+      return inserted_zero;
     }
   }
 
@@ -3586,7 +3647,7 @@ uint64_t CPMA<traits>::insert_batch(element_ptr_type e, uint64_t batch_size) {
     assert(check_rank_array());
     count_elements_ += num_elts_merged;
     total_timer.stop();
-    return num_elts_merged;
+    return num_elts_merged + inserted_zero;
   } else {
 
     // which leaves were touched during the merge
@@ -3657,7 +3718,7 @@ uint64_t CPMA<traits>::insert_batch(element_ptr_type e, uint64_t batch_size) {
     assert(check_rank_array());
     count_elements_ += num_elts_merged;
     total_timer.stop();
-    return num_elts_merged;
+    return num_elts_merged + inserted_zero;
   }
 }
 
@@ -4661,6 +4722,26 @@ bool CPMA<traits>::map(F f) const {
 }
 
 template <typename traits>
+template <class F>
+bool CPMA<traits>::parallel_map(F f) const {
+  if (!size()) {
+    return false;
+  }
+  if (has_0) {
+    f(0);
+  }
+  ParallelTools::parallel_for(0, total_leaves(),
+                              [&](uint64_t idx) {
+                                for (auto el : get_leaf(idx)) {
+                                  f(el);
+                                }
+                              }
+
+  );
+  return false;
+}
+
+template <typename traits>
 template <bool no_early_exit, class F>
 void CPMA<traits>::serial_map_with_hint(
     F f, key_type end_key, const typename leaf::iterator &hint) const {
@@ -4817,6 +4898,7 @@ CPMA<traits>::getDegreeVector(typename leaf::iterator *hints) const {
           (uint64_t *)malloc(sizeof(uint64_t) * (num_nodes())));
 
   ParallelTools::For<parallel>(0, num_nodes(), [&](size_t i) {
+    degrees.get()[i] = 0;
     serial_map_with_hint<true>(
         [&]([[maybe_unused]] uint64_t el) {
           degrees.get()[i] += 1;
