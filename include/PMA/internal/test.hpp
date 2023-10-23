@@ -1,46 +1,56 @@
 #pragma once
 
-#include "PMA/CPMA.hpp"
-#include "PMA/PMAkv.hpp"
-#include "ParallelTools/parallel.h"
-#include "ParallelTools/reducer.h"
+#include <algorithm> // generate
 #include <cstddef>
 #include <cstdint>
+#include <iomanip>
+#include <iostream> // cout
+#include <iterator> // begin, end, and ostream_iterator
+#include <limits>
+#include <random> // mt19937 and uniform_int_distribution
+#include <set>
+#include <sys/time.h>
+#include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector> // vector
 
 #include "PMA/internal/helpers.hpp"
 #include "PMA/internal/io_util.hpp"
 #include "PMA/internal/leaf.hpp"
 #include "PMA/internal/rmat_util.hpp"
 #include "PMA/internal/zipf.hpp"
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wshorten-64-to-32"
+#pragma clang diagnostic ignored "-Wpadded"
+#pragma clang diagnostic ignored "-Watomic-implicit-seq-cst"
+#pragma clang diagnostic ignored "-Wcast-qual"
+
+#include "ParallelTools/parallel.h"
+#include "ParallelTools/reducer.h"
+
 #include "parlay/primitives.h"
+#include "parlay/random.h"
 #include "parlay/sequence.h"
+
+#include "tlx/container/btree_map.hpp"
+#include "tlx/container/btree_set.hpp"
 
 #include "EdgeMapVertexMap/algorithms/BC.h"
 #include "EdgeMapVertexMap/algorithms/BFS.h"
 #include "EdgeMapVertexMap/algorithms/Components.h"
 #include "EdgeMapVertexMap/algorithms/PageRank.h"
 
-#include <iomanip>
-#include <limits>
-#include <set>
-#include <sys/time.h>
-#include <type_traits>
-#include <unordered_map>
-#include <unordered_set>
+#include "btree_size_helpers.hpp"
 
-#include <algorithm> // generate
-#include <iostream>  // cout
-#include <iterator>  // begin, end, and ostream_iterator
-#include <random>    // mt19937 and uniform_int_distribution
-#include <vector>    // vector
+#pragma clang diagnostic pop
 
-#include "parlay/random.h"
-
-#include "tlx/container/btree_map.hpp"
-#include "tlx/container/btree_set.hpp"
 // just redefines some things in the tlx btree so I can get access to the size
 // of the nodes
-#include "btree_size_helpers.hpp"
+
+#include "PMA/CPMA.hpp"
+#include "PMA/PMAkv.hpp"
 
 template <class T>
 std::vector<T> create_random_data_with_seed(size_t n, size_t max_val,
@@ -1552,8 +1562,8 @@ bool verify_leaf(uint32_t size, uint32_t num_ops, uint32_t range_start,
   for (int i = 0; i < num_leaves; i++) {
     leaf_type leaf2(heads[i], array + (i * size), size);
 
-    for (uint32_t elt : inputs) {
-      uint32_t e = 1 + 1000 * i + elt;
+    for (auto elt : inputs) {
+      auto e = 1 + 1000 * i + elt;
       sum += e;
       leaf2.template insert<head_in_place>(e);
     }
@@ -1893,7 +1903,9 @@ bool real_graph(const std::string &filename, int iters = 20,
             rMat<uint32_t>((uint32_t)nn, (uint32_t)r.ith_rand(it), a, b, c);
         std::vector<uint64_t> es(b_size);
         ParallelTools::parallel_for(0, b_size, [&](uint64_t i) {
-          std::pair<uint32_t, uint32_t> edge = rmat(i);
+          // rmat breaks if the batch is bigger than a uint32_t
+          assert(i < std::numeric_limits<uint32_t>::max());
+          std::pair<uint32_t, uint32_t> edge = rmat((uint32_t)i);
           es[i] = (static_cast<uint64_t>(edge.first) << 32U) | edge.second;
         });
 
@@ -2103,17 +2115,118 @@ batch_test(size_t num_elements_start, size_t batch_size, size_t num_bits = 40,
         return {-1UL, -1UL};
       }
     }
-    // std::random_device rd;
-    // std::mt19937 g(rd());
-    // auto delete_batch = parlay::random_shuffle(data_batches, rd());
+    std::random_device rd;
+    std::mt19937 g(rd());
+    auto delete_batch = parlay::random_shuffle(data_batches, rd());
 
-    // start = get_usecs();
-    // for (auto *batch_start = delete_batch.data();
-    //      batch_start < delete_batch.data() + delete_batch.size();
-    //      batch_start += batch_size) {
-    //   pma.remove_batch(batch_start, batch_size);
-    // }
-    // end = get_usecs();
+    start = get_usecs();
+    for (auto *batch_start = delete_batch.data();
+         batch_start < delete_batch.data() + delete_batch.size();
+         batch_start += batch_size) {
+      pma.remove_batch(batch_start, batch_size);
+    }
+    end = get_usecs();
+    if (verify) {
+      for (const auto &el : data_batches) {
+        correct.erase(el);
+      }
+      if (pma_different_from_set(pma, correct)) {
+        printf("bad pma\n");
+        return {-1UL, -1UL};
+      }
+    }
+    if (i > 0) {
+      delete_total += end - start;
+    }
+  }
+  if (iters == 0) {
+    iters = 1;
+  }
+  return {insert_total / iters, delete_total / iters};
+}
+
+template <typename traits>
+std::tuple<uint64_t, uint64_t>
+batch_test_zip(size_t num_elements_start, size_t batch_size,
+               size_t num_bits = 34, size_t iters = 10, bool verify = false,
+               double alpha = .99) {
+  uint64_t insert_total = 0;
+  uint64_t delete_total = 0;
+  for (size_t i = 0; i < iters + 1; i++) {
+
+    uint64_t start = 0;
+    uint64_t end = 0;
+    auto data_start = create_random_data_in_parallel<typename traits::key_type>(
+        num_elements_start, 1UL << num_bits);
+
+    tlx::btree_set<typename traits::key_type> correct;
+    if (verify) {
+      correct.insert(data_start.begin(), data_start.end());
+    }
+
+    CPMA<traits> pma;
+    pma.insert_batch(data_start.data(), data_start.size());
+    std::cout << "starting elements = " << pma.size() << "\n";
+    data_start.clear();
+    split_cnt.reset();
+    size_cnt.reset();
+    search_cnt.reset();
+    search_steps_cnt.reset();
+    parallel_zipf<typename traits::key_type> zip(1UL << num_bits, alpha, 0);
+    auto data_batches = zip.gen_vector(num_elements_start);
+    if (verify) {
+      correct.insert(data_batches.begin(), data_batches.end());
+    }
+    start = get_usecs();
+    for (auto *batch_start = data_batches.data();
+         batch_start < data_batches.data() + data_batches.size();
+         batch_start += batch_size) {
+      pma.insert_batch(batch_start, batch_size);
+    }
+    end = get_usecs();
+    split_cnt.report();
+    size_cnt.report();
+    search_cnt.report();
+    search_steps_cnt.report();
+    if (i > 0 || iters == 0) {
+      insert_total += end - start;
+    }
+
+    if (!verify) {
+      printf("batch_size = %lu, total sum = %lu, insert time = %lu, "
+             "num_elements = %lu\n",
+             batch_size, pma.sum(), end - start, pma.size());
+    }
+    if (verify) {
+      if (pma_different_from_set(pma, correct)) {
+        printf("bad pma\n");
+        return {-1UL, -1UL};
+      }
+    }
+    std::random_device rd;
+    std::mt19937 g(rd());
+    auto delete_batch = parlay::random_shuffle(data_batches, rd());
+
+    start = get_usecs();
+    for (auto *batch_start = delete_batch.data();
+         batch_start < delete_batch.data() + delete_batch.size();
+         batch_start += batch_size) {
+      pma.remove_batch(batch_start, batch_size);
+    }
+    end = get_usecs();
+    if (!verify) {
+      printf("batch_size = %lu, total sum = %lu, delete time = %lu\n",
+             batch_size, pma.sum(), end - start);
+    }
+    if (verify) {
+      for (const auto &el : data_batches) {
+        correct.erase(el);
+      }
+      if (pma_different_from_set(pma, correct)) {
+        printf("bad pma\n");
+        return {-1UL, -1UL};
+      }
+    }
     if (i > 0) {
       delete_total += end - start;
     }
@@ -2186,6 +2299,37 @@ bool batch_bench(size_t num_elements_start, size_t num_bits = 40,
     }
     auto results = batch_test<traits>(num_elements_start, batch_size, num_bits,
                                       iters, verify, insert_sorted);
+    insert_total[batch_size] = std::get<0>(results);
+    delete_total[batch_size] = std::get<1>(results);
+  }
+
+  for (size_t batch_size = 1; batch_size < num_elements_start;
+       batch_size *= 10) {
+    printf("%lu, %lu, %lu\n", batch_size, insert_total[batch_size],
+           delete_total[batch_size]);
+  }
+  return false;
+}
+
+template <typename traits>
+bool batch_bench_zip(size_t num_elements_start, size_t num_bits = 34,
+                     size_t iters = 5, bool verify = false,
+                     double alpha = .99) {
+  if (num_elements_start >=
+      (uint64_t)std::numeric_limits<typename traits::key_type>::max()) {
+    return false;
+  }
+  std::map<size_t, uint64_t> insert_total;
+  std::map<size_t, uint64_t> delete_total;
+
+  for (size_t batch_size = 1; batch_size < num_elements_start;
+       batch_size *= 10) {
+    if (num_elements_start + batch_size >
+        (uint64_t)std::numeric_limits<typename traits::key_type>::max()) {
+      break;
+    }
+    auto results = batch_test_zip<traits>(num_elements_start, batch_size,
+                                          num_bits, iters, verify, alpha);
     insert_total[batch_size] = std::get<0>(results);
     delete_total[batch_size] = std::get<1>(results);
   }

@@ -143,6 +143,25 @@ int main(int32_t argc, char *argv[]) {
     }
     batch_bench<traits>(atoll(argv[2]), 40, trials, verify, insert_sorted);
   }
+  if (std::string("batch_bench_zip") == argv[1]) {
+    uint64_t trials = 10;
+    if (argc >= 4) {
+      trials = atoll(argv[3]);
+    }
+    bool verify = false;
+    if (argc >= 5) {
+      verify = atoll(argv[4]);
+    }
+    double alpha = .99;
+    if (argc >= 6) {
+      alpha = atof(argv[5]);
+    }
+    uint64_t num_bits = 34;
+    if (argc >= 7) {
+      num_bits = atoll(argv[6]);
+    }
+    batch_bench_zip<traits>(atoll(argv[2]), num_bits, trials, verify, alpha);
+  }
   if (std::string("batch") == argv[1]) {
 
     uint64_t trials = 10;

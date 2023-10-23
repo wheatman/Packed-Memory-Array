@@ -1,10 +1,6 @@
 #ifndef CPMA_HPP
 #define CPMA_HPP
-#include "ParallelTools/concurrent_hash_map.hpp"
-#include "ParallelTools/flat_hash_map.hpp"
-#include "ParallelTools/parallel.h"
-#include "ParallelTools/reducer.h"
-#include "ParallelTools/sort.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -21,20 +17,6 @@
 #include <optional>
 #include <type_traits>
 #include <vector>
-
-#include "StructOfArrays/soa.hpp"
-
-#if !defined(NO_TLX)
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wfloat-equal"
-#pragma clang diagnostic ignored "-Wpadded"
-#include "tlx/container/btree_map.hpp"
-#pragma clang diagnostic pop
-#endif
-
-#if VQSORT == 1
-#include <hwy/contrib/sort/vqsort.h>
-#endif
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wsign-compare"
@@ -56,6 +38,29 @@
 #pragma clang diagnostic ignored "-Wshadow-uncaptured-local"
 #pragma clang diagnostic ignored "-Wshadow-field-in-constructor"
 #pragma clang diagnostic ignored "-Wshadow"
+#pragma clang diagnostic ignored "-Wshorten-64-to-32"
+
+#if !defined(NO_TLX)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wfloat-equal"
+#pragma clang diagnostic ignored "-Wpadded"
+#include "tlx/container/btree_map.hpp"
+#pragma clang diagnostic pop
+#endif
+
+#if VQSORT == 1
+#include <hwy/contrib/sort/vqsort.h>
+#endif
+
+#include "ParallelTools/concurrent_hash_map.hpp"
+#include "ParallelTools/flat_hash_map.hpp"
+#include "ParallelTools/parallel.h"
+#include "ParallelTools/reducer.h"
+#include "ParallelTools/sort.hpp"
+
+#include "StructOfArrays/multipointer.hpp"
+#include "StructOfArrays/soa.hpp"
+
 #include "parlay/primitives.h"
 #pragma clang diagnostic pop
 
@@ -994,7 +999,11 @@ public:
   static constexpr bool compressed = leaf::compressed;
   explicit CPMA();
   // Move constructor
-  CPMA(CPMA &&other) noexcept : meta_data_index(other.meta_data_index), has_0(other.has_0), count_elements_(other.count_elements_), underlying_array(other.underlying_array) {
+  CPMA(CPMA &&other)
+  noexcept
+      : meta_data_index(other.meta_data_index), has_0(other.has_0),
+        count_elements_(other.count_elements_),
+        underlying_array(other.underlying_array) {
     other.count_elements_ = 0;
     other.meta_data_index = 0;
     other.has_0 = false;
@@ -1006,7 +1015,10 @@ public:
 #endif
   }
   // Copy constructor
-  CPMA(const CPMA &other) noexcept : meta_data_index(other.meta_data_index), has_0(other.has_0), count_elements_(other.count_elements_) {
+  CPMA(const CPMA &other)
+  noexcept
+      : meta_data_index(other.meta_data_index), has_0(other.has_0),
+        count_elements_(other.count_elements_) {
     if constexpr (fixed_size) {
       underlying_array = other.underlying_array;
     } else {
@@ -1015,15 +1027,15 @@ public:
         allocated_size += 32 - (allocated_size % 32);
       }
       underlying_array = aligned_alloc(32, allocated_size);
-      ParallelTools::parallel_for(0, other.underlying_array_size(), [&](size_t i) {
-        underlying_array[i] = other.underlying_array[i];
-      });
+      ParallelTools::parallel_for(
+          0, other.underlying_array_size(),
+          [&](size_t i) { underlying_array[i] = other.underlying_array[i]; });
     }
 #if VQSORT == 1
     sorter = other.sorter;
 #endif
   }
-//   // Move assignment
+  //   // Move assignment
   CPMA &operator=(CPMA &&other) noexcept {
     if (this == &other) {
       return *this;
@@ -1059,9 +1071,10 @@ public:
         allocated_size += 32 - (allocated_size % 32);
       }
       underlying_array = aligned_alloc(32, allocated_size);
-      ParallelTools::parallel_for(0, other.underlying_array_size(), [&](size_t i) {
-        underlying_array_char()[i] = other.underlying_array_char()[i];
-      });
+      ParallelTools::parallel_for(
+          0, other.underlying_array_size(), [&](size_t i) {
+            underlying_array_char()[i] = other.underlying_array_char()[i];
+          });
     }
 #if VQSORT == 1
     sorter = other.sorter;
@@ -1106,8 +1119,9 @@ public:
   bool update_by_rank(element_type e, uint64_t rank);
   uint64_t rank(key_type e);
   typename traits::element_type select(uint64_t rank) const;
-  uint64_t insert_batch(element_ptr_type e, uint64_t batch_size);
-  uint64_t remove_batch(key_type *e, uint64_t batch_size);
+  uint64_t insert_batch(element_ptr_type e, uint64_t batch_size,
+                        bool sorted = false);
+  uint64_t remove_batch(key_type *e, uint64_t batch_size, bool sorted = false);
   // split num is the index of which partition you are
   template <class Vector_pairs>
   uint64_t insert_batch_internal(element_ptr_type e, uint64_t batch_size,
@@ -1117,6 +1131,13 @@ public:
   template <class Vector_pairs>
   uint64_t insert_batch_internal_small_batch(element_ptr_type e,
                                              uint64_t batch_size,
+                                             Vector_pairs &leaves_to_check,
+                                             uint64_t start_leaf_idx,
+                                             uint64_t end_leaf_idx,
+                                             Vector_pairs &rank_additions);
+
+  template <class Vector_pairs>
+  uint64_t remove_batch_internal_small_batch(key_type *e, uint64_t batch_size,
                                              Vector_pairs &leaves_to_check,
                                              uint64_t start_leaf_idx,
                                              uint64_t end_leaf_idx,
@@ -2332,7 +2353,8 @@ uint64_t CPMA<traits>::insert_batch_internal_small_batch(
 
   uint64_t num_elts_merged = 0;
 
-  if (batch_size * 10 >= (end_leaf_idx - start_leaf_idx) / elts_per_leaf()) {
+  if (batch_size * 10 >= (end_leaf_idx - start_leaf_idx) / elts_per_leaf() &&
+      batch_size < 1000) {
     while (start_leaf_idx + elts_per_leaf() < end_leaf_idx &&
            e.get() <
                index_to_head_key((start_leaf_idx / elts_per_leaf()) + 1)) {
@@ -2473,6 +2495,185 @@ uint64_t CPMA<traits>::insert_batch_internal_small_batch(
   num_elts_merged += ret1;
   num_elts_merged += ret2;
   return num_elts_merged;
+}
+
+template <typename traits>
+template <class Vector_pairs>
+uint64_t CPMA<traits>::remove_batch_internal_small_batch(
+    key_type *e, uint64_t batch_size, Vector_pairs &leaves_to_check,
+    uint64_t start_leaf_idx, uint64_t end_leaf_idx,
+    Vector_pairs &rank_additions) {
+  if (batch_size == 0 || start_leaf_idx == end_leaf_idx) {
+    return 0;
+  }
+  // not technically true, but probably true
+  assert(batch_size < 1000000000000UL);
+  ASSERT(start_leaf_idx < end_leaf_idx,
+         "start_leaf_idx = %lu, end_leaf_idx = %lu, total_size = %lu\n",
+         start_leaf_idx, end_leaf_idx, N() / sizeof(key_type));
+  if (batch_size == 1) {
+    uint64_t leaf_number =
+        find_containing_leaf_number(*e, start_leaf_idx, end_leaf_idx);
+    auto [removed, bytes_used] =
+        get_leaf(leaf_number).template remove<head_form == InPlace>(*e);
+    if (!removed) {
+      return 0;
+    }
+    if constexpr (support_rank) {
+      rank_additions.push_back({leaf_number, -1});
+    }
+    if constexpr (store_density) {
+      density_array()[leaf_number] =
+          std::min(bytes_used,
+                   static_cast<uint64_t>(std::numeric_limits<uint16_t>::max()));
+    }
+    ASSERT(bytes_used == get_density_count(leaf_number * logN(), logN()),
+           "got %lu, expected %lu\n", bytes_used,
+           get_density_count(leaf_number * logN(), logN()));
+    if (bytes_used < logN() * lower_density_bound(H()) || bytes_used == 0) {
+      leaves_to_check.push_back({leaf_number * elts_per_leaf(), bytes_used});
+    }
+    return 1;
+  }
+
+  uint64_t num_elts_removed = 0;
+
+  if (batch_size * 10 >= (end_leaf_idx - start_leaf_idx) / elts_per_leaf() &&
+      batch_size < 1000) {
+    while (start_leaf_idx + elts_per_leaf() < end_leaf_idx &&
+           *e < index_to_head_key((start_leaf_idx / elts_per_leaf()) + 1)) {
+      auto result =
+          get_leaf(start_leaf_idx / elts_per_leaf())
+              .template strip_from_leaf<head_form == InPlace>(
+                  e, e + batch_size,
+                  index_to_head_key((start_leaf_idx / elts_per_leaf()) + 1));
+      num_elts_removed += std::get<1>(result);
+
+      if constexpr (support_rank) {
+        if (std::get<1>(result)) {
+          rank_additions.push_back(
+              {start_leaf_idx / elts_per_leaf(), -1 * std::get<1>(result)});
+        }
+      }
+      if (std::get<1>(result)) {
+        auto bytes_used = std::get<2>(result);
+        if constexpr (store_density) {
+          density_array()[start_leaf_idx / elts_per_leaf()] = std::min(
+              bytes_used,
+              static_cast<uint64_t>(std::numeric_limits<uint16_t>::max()));
+        }
+        ASSERT(bytes_used ==
+                   get_density_count(start_leaf_idx * sizeof(key_type), logN()),
+               "got %lu, expected %lu\n", bytes_used,
+               get_density_count(start_leaf_idx * sizeof(key_type), logN()));
+        // if exceeded leaf density bound, add self to per-worker queue for
+        // leaves to rebalance
+        if (bytes_used < logN() * lower_density_bound(H()) || bytes_used == 0) {
+          leaves_to_check.push_back({start_leaf_idx, bytes_used});
+        }
+      }
+      uint64_t num_elements_in = std::get<0>(result) - e;
+      batch_size = batch_size - num_elements_in;
+      if (batch_size == 0) {
+        return num_elts_removed;
+      }
+      e = std::get<0>(result);
+      start_leaf_idx += elts_per_leaf();
+    }
+  }
+
+  // else we want to start with the middle element
+  key_type *middle = e + (batch_size / 2);
+  uint64_t leaf_idx =
+      find_containing_leaf_index(*middle, start_leaf_idx, end_leaf_idx);
+  // then we want to find the first element in the batch which is in the same
+  // leaf as the middle element
+  assert(leaf_idx / elts_per_leaf() < total_leaves());
+  key_type head = index_to_head_key(leaf_idx / elts_per_leaf());
+  if (leaf_idx == 0) {
+    middle = e;
+  }
+  while ((middle - 1 >= e) && ((middle[-1]) >= head)) {
+    middle = middle - 1;
+  }
+
+  uint64_t next_head = std::numeric_limits<uint64_t>::max(); // max int
+  if (leaf_idx + elts_per_leaf() < end_leaf_idx) {
+    next_head = index_to_head_key((leaf_idx / elts_per_leaf()) + 1);
+  }
+  assert(*middle < next_head);
+  auto result = get_leaf(leaf_idx / elts_per_leaf())
+                    .template strip_from_leaf<head_form == InPlace>(
+                        middle, e + batch_size, next_head);
+  num_elts_removed += std::get<1>(result);
+
+  if constexpr (support_rank) {
+    if (std::get<1>(result)) {
+      rank_additions.push_back(
+          {leaf_idx / elts_per_leaf(), -1 * std::get<1>(result)});
+    }
+  }
+  auto bytes_used = std::get<2>(result);
+
+  if (std::get<1>(result)) {
+    if constexpr (store_density) {
+      density_array()[leaf_idx / elts_per_leaf()] =
+          std::min(bytes_used,
+                   static_cast<uint64_t>(std::numeric_limits<uint16_t>::max()));
+    }
+    ASSERT(bytes_used == get_density_count(leaf_idx * sizeof(key_type), logN()),
+           "got %lu, expected %lu\n", bytes_used,
+           get_density_count(leaf_idx * sizeof(key_type), logN()));
+    // if exceeded leaf density bound, add self to per-worker queue for
+    // leaves to rebalance
+    if (bytes_used < logN() * lower_density_bound(H()) || bytes_used == 0) {
+      leaves_to_check.push_back({leaf_idx, bytes_used});
+    }
+  }
+  // if their are elements before do them with the new bounds we have
+  uint64_t ret1 = 0;
+  uint64_t ret2 = 0;
+
+  uint64_t early_stage_size = middle - e;
+  uint64_t late_stage_size = 0;
+  if (std::get<0>(result) < e + batch_size) {
+    uint64_t late_num_elements_in = std::get<0>(result) - e;
+    late_stage_size = batch_size - late_num_elements_in;
+  }
+
+  if constexpr (!parallel) {
+    ret1 = remove_batch_internal_small_batch(e, early_stage_size,
+                                             leaves_to_check, start_leaf_idx,
+                                             leaf_idx, rank_additions);
+    ret2 = remove_batch_internal_small_batch(
+        std::get<0>(result), late_stage_size, leaves_to_check,
+        leaf_idx + elts_per_leaf(), end_leaf_idx, rank_additions);
+  } else {
+
+    if (early_stage_size <= 20 || late_stage_size <= 20) {
+      ret1 = remove_batch_internal_small_batch(e, early_stage_size,
+                                               leaves_to_check, start_leaf_idx,
+                                               leaf_idx, rank_additions);
+      ret2 = remove_batch_internal_small_batch(
+          std::get<0>(result), late_stage_size, leaves_to_check,
+          leaf_idx + elts_per_leaf(), end_leaf_idx, rank_additions);
+    } else {
+      ParallelTools::par_do(
+          [&]() {
+            ret1 = remove_batch_internal_small_batch(
+                e, early_stage_size, leaves_to_check, start_leaf_idx, leaf_idx,
+                rank_additions);
+          },
+          [&]() {
+            ret2 = remove_batch_internal_small_batch(
+                std::get<0>(result), late_stage_size, leaves_to_check,
+                leaf_idx + elts_per_leaf(), end_leaf_idx, rank_additions);
+          });
+    }
+  }
+  num_elts_removed += ret1;
+  num_elts_removed += ret2;
+  return num_elts_removed;
 }
 
 // mark all leaves that exceed their density bound
@@ -3441,7 +3642,8 @@ void CPMA<traits>::redistribute_ranges(
 // return true if the element was inserted, false if it was already there
 // return number of things inserted (not already there)
 template <typename traits>
-uint64_t CPMA<traits>::insert_batch(element_ptr_type e, uint64_t batch_size) {
+uint64_t CPMA<traits>::insert_batch(element_ptr_type e, uint64_t batch_size,
+                                    bool sorted) {
   timer total_timer("insert_batch");
   total_timer.start();
   if (batch_size < 100) {
@@ -3472,10 +3674,11 @@ uint64_t CPMA<traits>::insert_batch(element_ptr_type e, uint64_t batch_size) {
   assert(check_leaf_heads());
 
   timer sort_timer("sort");
-
-  sort_timer.start();
-  sort_batch(e, batch_size);
-  sort_timer.stop();
+  if (!sorted) {
+    sort_timer.start();
+    sort_batch(e, batch_size);
+    sort_timer.stop();
+  }
   bool inserted_zero = false;
 
   // TODO(wheatman) currently only works for unsigned types
@@ -3486,8 +3689,8 @@ uint64_t CPMA<traits>::insert_batch(element_ptr_type e, uint64_t batch_size) {
       }
     } else {
       get_data_ref(-1) = e[0];
-      inserted_zero = true;
     }
+    inserted_zero = true;
     has_0 = true;
 
     ++e;
@@ -3684,7 +3887,6 @@ uint64_t CPMA<traits>::insert_batch(element_ptr_type e, uint64_t batch_size) {
       timer double_timer("doubling");
       double_timer.start();
 
-      uint64_t target_size = N();
       uint64_t grow_times = 0;
       auto bytes_occupied = full_opt.value();
 
@@ -3693,12 +3895,9 @@ uint64_t CPMA<traits>::insert_batch(element_ptr_type e, uint64_t batch_size) {
       uint64_t bytes_required =
           std::max(N() * growing_factor, bytes_occupied * growing_factor);
       // not technically true, but we don't have enough memory anyway
-      assert((bytes_required <
-              std::numeric_limits<uint64_t>::max() /
-                  (growing_factor * growing_factor * growing_factor)));
+      assert((bytes_required < std::numeric_limits<uint64_t>::max() / 10));
 
-      while (target_size <= bytes_required) {
-        target_size *= growing_factor;
+      while (meta_data[meta_data_index + grow_times].n <= bytes_required) {
         grow_times += 1;
       }
 
@@ -3725,7 +3924,8 @@ uint64_t CPMA<traits>::insert_batch(element_ptr_type e, uint64_t batch_size) {
 // input: batch, number of elts in a batch
 // return number of things removed
 template <typename traits>
-uint64_t CPMA<traits>::remove_batch(key_type *e, uint64_t batch_size) {
+uint64_t CPMA<traits>::remove_batch(key_type *e, uint64_t batch_size,
+                                    bool sorted) {
   assert(check_leaf_heads());
   static_timer total_timer("remove_batch");
   total_timer.start();
@@ -3733,7 +3933,7 @@ uint64_t CPMA<traits>::remove_batch(key_type *e, uint64_t batch_size) {
   if (get_element_count() == 0 || batch_size == 0) {
     return 0;
   }
-  if (batch_size <= 100) {
+  if (batch_size < 100) {
     uint64_t count = 0;
     for (uint64_t i = 0; i < batch_size; i++) {
       count += remove(e[i]);
@@ -3743,9 +3943,11 @@ uint64_t CPMA<traits>::remove_batch(key_type *e, uint64_t batch_size) {
 
   static_timer sort_timer("sort_remove_batch");
 
-  sort_timer.start();
-  sort_batch(e, batch_size);
-  sort_timer.stop();
+  if (!sorted) {
+    sort_timer.start();
+    sort_batch(e, batch_size);
+    sort_timer.stop();
+  }
 
   // TODO(wheatman) currently only works for unsigned types
   while (*e == 0) {
@@ -3764,57 +3966,68 @@ uint64_t CPMA<traits>::remove_batch(key_type *e, uint64_t batch_size) {
   uint64_t num_leaves = total_leaves();
 
   if constexpr (parallel) {
-    // leaves per partition
-    uint64_t split_points =
-        std::min({(uint64_t)num_leaves / 10, (uint64_t)batch_size / 100,
-                  (uint64_t)ParallelTools::getWorkers() * 10});
-    split_points = std::max(split_points, 1UL);
+
     // which leaves were touched during the merge
     ParallelTools::Reducer_Vector<std::pair<uint64_t, uint64_t>>
         leaves_to_check;
 
+    ParallelTools::Reducer_Vector<std::pair<uint64_t, uint64_t>> rank_additions;
+
     uint64_t num_elts_removed = 0;
-
-    std::vector<leaf_bound_t> leaf_bounds = get_leaf_bounds(split_points);
-
-    ParallelTools::Reducer_sum<uint64_t> num_elts_removed_reduce;
 
     static_timer merge_timer("merge_timer_remove_batch");
     merge_timer.start();
-    ParallelTools::Reducer_Vector<std::pair<uint64_t, uint64_t>> rank_additions;
-    ParallelTools::parallel_for(0, split_points, [&](uint64_t i) {
-      if (leaf_bounds[i].start_leaf_index == leaf_bounds[i].end_leaf_index) {
-        return;
-      }
 
-      // search for boundaries in batch
-      key_type *batch_start =
-          std::lower_bound(e, e + batch_size, leaf_bounds[i].start_elt);
-      // if we are the first batch start at the begining
-      if (i == 0) {
-        batch_start = e;
-      }
-      uint64_t end_elt = leaf_bounds[i].end_elt;
-      if (i == split_points - 1) {
-        end_elt = std::numeric_limits<uint64_t>::max();
-      }
-      key_type *batch_end = std::lower_bound(e, e + batch_size, end_elt);
+    if constexpr (false) {
 
-      if (batch_start == batch_end || batch_start == e + batch_size) {
-        return;
-      }
+      // leaves per partition
+      uint64_t split_points =
+          std::min({(uint64_t)num_leaves / 10, (uint64_t)batch_size / 100,
+                    (uint64_t)ParallelTools::getWorkers() * 10});
+      split_points = std::max(split_points, 1UL);
 
-      // number of elts we are merging
-      uint64_t range_size = uint64_t(batch_end - batch_start);
+      std::vector<leaf_bound_t> leaf_bounds = get_leaf_bounds(split_points);
 
-      // do the merge
-      num_elts_removed_reduce.add(
-          remove_batch_internal(batch_start, range_size, leaves_to_check,
-                                leaf_bounds[i].start_leaf_index,
-                                leaf_bounds[i].end_leaf_index, rank_additions));
-    });
-    num_elts_removed = num_elts_removed_reduce.get();
-    merge_timer.stop();
+      ParallelTools::Reducer_sum<uint64_t> num_elts_removed_reduce;
+
+      ParallelTools::parallel_for(0, split_points, [&](uint64_t i) {
+        if (leaf_bounds[i].start_leaf_index == leaf_bounds[i].end_leaf_index) {
+          return;
+        }
+
+        // search for boundaries in batch
+        key_type *batch_start =
+            std::lower_bound(e, e + batch_size, leaf_bounds[i].start_elt);
+        // if we are the first batch start at the begining
+        if (i == 0) {
+          batch_start = e;
+        }
+        uint64_t end_elt = leaf_bounds[i].end_elt;
+        if (i == split_points - 1) {
+          end_elt = std::numeric_limits<uint64_t>::max();
+        }
+        key_type *batch_end = std::lower_bound(e, e + batch_size, end_elt);
+
+        if (batch_start == batch_end || batch_start == e + batch_size) {
+          return;
+        }
+
+        // number of elts we are merging
+        uint64_t range_size = uint64_t(batch_end - batch_start);
+
+        // do the merge
+        num_elts_removed_reduce.add(remove_batch_internal(
+            batch_start, range_size, leaves_to_check,
+            leaf_bounds[i].start_leaf_index, leaf_bounds[i].end_leaf_index,
+            rank_additions));
+      });
+      num_elts_removed = num_elts_removed_reduce.get();
+      merge_timer.stop();
+    } else {
+      num_elts_removed += remove_batch_internal_small_batch(
+          e, batch_size, leaves_to_check, 0, num_leaves * elts_per_leaf(),
+          rank_additions);
+    }
     if constexpr (support_rank) {
       update_rank(rank_additions);
     }
@@ -3931,7 +4144,6 @@ uint64_t CPMA<traits>::remove_batch(key_type *e, uint64_t batch_size) {
     if (full_opt.has_value()) {
       static_timer shrinking_timer("shrinking");
       shrinking_timer.start();
-      uint64_t target_size = N();
       uint64_t shrink_times = 0;
       auto bytes_occupied = full_opt.value();
 
@@ -3941,11 +4153,12 @@ uint64_t CPMA<traits>::remove_batch(key_type *e, uint64_t batch_size) {
         bytes_required = 1;
       }
 
-      while (target_size >= bytes_required) {
-        target_size /= growing_factor;
+      while (meta_data[meta_data_index - shrink_times].n >= bytes_required) {
         shrink_times += 1;
+        if (meta_data_index == shrink_times) {
+          break;
+        }
       }
-
       shrink_list(shrink_times);
       shrinking_timer.stop();
       assert(check_rank_array());
@@ -4757,10 +4970,9 @@ void CPMA<traits>::serial_map_with_hint(
       f(*it);
     } else {
       if (f(*it)) {
-          return;
+        return;
       }
     }
-
   }
 }
 
@@ -4783,7 +4995,7 @@ void CPMA<traits>::serial_map_with_hint_par(
       f(*it);
     } else {
       if (f(*it)) {
-          return;
+        return;
       }
     }
   }
@@ -4814,8 +5026,10 @@ void CPMA<traits>::serial_map_with_hint_par(
     if (el >= end_key) {
       break;
     }
-    if (f(el)) {
-      if constexpr (!no_early_exit) {
+    if constexpr (no_early_exit) {
+      f(el);
+    } else {
+      if (f(el)) {
         break;
       }
     }
