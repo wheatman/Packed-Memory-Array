@@ -4777,7 +4777,7 @@ template <typename traits>
 uint64_t CPMA<traits>::sum_serial(int64_t start, int64_t end) const {
 #ifdef __AVX512F__
   if constexpr (!compressed && std::is_same_v<key_type, uint64_t>) {
-    __m512i total_vec = _mm512_setzero();
+    __m512i total_vec = _mm512_setzero_si512();
     // __m256i total_vec = _mm256_setzero_si256();
     for (int64_t i = start; i < end; i++) {
       total_vec = _mm512_add_epi64(
@@ -4921,14 +4921,32 @@ bool CPMA<traits>::map(F f) const {
   if (!size()) {
     return false;
   }
-#pragma clang loop unroll_count(4)
-  for (const auto &el : *this) {
-    if constexpr (!no_early_exit) {
-      if (f(el)) {
-        return true;
+  if (has_0) {
+    if constexpr (no_early_exit) {
+      if constexpr (binary) {
+        f(0);
+      } else {
+        f(get_data_ref(-1));
       }
     } else {
-      f(el);
+      if constexpr (binary) {
+        if (f(0)) {
+          return true;
+        }
+      } else {
+        if (f(get_data_ref(-1))) {
+          return true;
+        }
+      }
+    }
+  }
+  for (size_t i = 0; i < total_leaves(); i++) {
+    if constexpr (no_early_exit) {
+      get_leaf(i).template map<no_early_exit, F>(f);
+    } else {
+      if (get_leaf(i).template map<no_early_exit, F>(f)) {
+        return true;
+      }
     }
   }
   return false;
@@ -4941,14 +4959,15 @@ bool CPMA<traits>::parallel_map(F f) const {
     return false;
   }
   if (has_0) {
-    f(0);
+    if constexpr (binary) {
+      f(0);
+    } else {
+      f(get_data_ref(-1));
+    }
   }
-  ParallelTools::parallel_for(0, total_leaves(),
-                              [&](uint64_t idx) {
-                                for (auto el : get_leaf(idx)) {
-                                  f(el);
-                                }
-                              }
+  ParallelTools::parallel_for(
+      0, total_leaves(),
+      [&](uint64_t idx) { get_leaf(idx).template map<true, F>(f); }
 
   );
   return false;
@@ -5002,20 +5021,9 @@ void CPMA<traits>::serial_map_with_hint_par(
   leaf_number += 1;
   // if there is an leaves in the middle do them in parallel
   if (leaf_number < leaf_number_end) {
-    ParallelTools::parallel_for(leaf_number, leaf_number_end,
-                                [&](uint64_t idx) {
-                                  if (index_to_head_key(idx) >= end_key) {
-                                    return;
-                                  }
-                                  assert(idx < total_leaves());
-                                  for (auto el : get_leaf(idx)) {
-                                    if (f(el)) {
-                                      if constexpr (!no_early_exit) {
-                                        break;
-                                      }
-                                    }
-                                  }
-                                }
+    ParallelTools::parallel_for(
+        leaf_number, leaf_number_end,
+        [&](uint64_t idx) { get_leaf(idx).template map<no_early_exit, F>(f); }
 
     );
   }

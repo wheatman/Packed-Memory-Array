@@ -1906,6 +1906,32 @@ public:
   }
 #endif
 
+  template <bool no_early_exit, class F> bool map(F f) const {
+    T curr_elem = head;
+    if constexpr (no_early_exit) {
+      f(curr_elem);
+    } else {
+      if (f(curr_elem)) {
+        return true;
+      }
+    }
+    int64_t curr_loc = 0;
+    DecodeResult dr(array);
+    while (dr.difference != 0) {
+      curr_elem += dr.difference;
+      if constexpr (no_early_exit) {
+        f(curr_elem);
+      } else {
+        if (f(curr_elem)) {
+          return true;
+        }
+      }
+      curr_loc += dr.old_size;
+      dr = DecodeResult(array + curr_loc);
+    }
+    return false;
+  }
+
   static std::pair<uint8_t *, T>
   find_loc_and_difference_with_hint(T element, uint8_t *position, T curr_elem) {
     DecodeResult dr(position);
@@ -3746,6 +3772,36 @@ public:
       }
       return head_key() + curr_sum;
     }
+  }
+
+  template <bool no_early_exit, class F> bool map(F f) const {
+    auto unwrap = [](auto elem) {
+      if constexpr (binary) {
+        return std::get<0>(elem);
+      } else {
+        return elem;
+      }
+    };
+    if constexpr (no_early_exit) {
+      f(unwrap(head));
+    } else {
+      if (f(unwrap(head))) {
+        return true;
+      }
+    }
+    for (uint64_t i = 0; i < length_in_elements; i++) {
+      if (array.get(i) == 0) {
+        return false;
+      }
+      if constexpr (no_early_exit) {
+        f(unwrap(array[i]));
+      } else {
+        if (f(unwrap(array[i]))) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   template <bool head_in_place = false> [[nodiscard]] __m512i sum512() const {
