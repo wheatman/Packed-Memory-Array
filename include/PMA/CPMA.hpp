@@ -4965,11 +4965,17 @@ bool CPMA<traits>::parallel_map(F f) const {
       f(get_data_ref(-1));
     }
   }
-  ParallelTools::parallel_for(
+  if (total_leaves() > 100) {
+    ParallelTools::parallel_for(
       0, total_leaves(),
       [&](uint64_t idx) { get_leaf(idx).template map<true, F>(f); }
 
-  );
+    );
+  } else {
+    for (size_t idx = 0; idx < total_leaves(); idx++) {
+      get_leaf(idx).template map<true, F>(f);
+    }
+  }
   return false;
 }
 
@@ -5018,14 +5024,23 @@ void CPMA<traits>::serial_map_with_hint_par(
       }
     }
   }
+  if (leaf_number == leaf_number_end) {
+    return;
+  }
   leaf_number += 1;
   // if there is an leaves in the middle do them in parallel
   if (leaf_number < leaf_number_end) {
-    ParallelTools::parallel_for(
+    if (leaf_number_end - leaf_number > 50) {
+      ParallelTools::parallel_for(
         leaf_number, leaf_number_end,
         [&](uint64_t idx) { get_leaf(idx).template map<no_early_exit, F>(f); }
 
-    );
+      );
+    } else {
+      for (size_t idx = leaf_number; idx < leaf_number_end; idx++) {
+        get_leaf(idx).template map<no_early_exit, F>(f);
+      }
+    }
   }
 
   // do the last leaf

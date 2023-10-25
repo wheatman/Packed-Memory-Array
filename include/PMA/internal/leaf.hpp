@@ -169,6 +169,16 @@ private:
         0b111111111111111111111111111111111111111111UL,
         0b1111111111111111111111111111111111111111111111111UL,
         0b11111111111111111111111111111111111111111111111111111111UL};
+      static constexpr std::array<uint64_t, 9> extract_masks2_ = {
+        0,
+        0b1111111UL,
+        0b11111111111111UL,
+        0b111111111111111111111UL,
+        0b1111111111111111111111111111UL,
+        0b11111111111111111111111111111111111UL,
+        0b111111111111111111111111111111111111111111UL,
+        0b1111111111111111111111111111111111111111111111111UL,
+        0b11111111111111111111111111111111111111111111111111111111UL};
 
     static constexpr std::array<uint64_t, 255> get_extract_masks3() {
       std::array<uint64_t, 255> arr = {0};
@@ -268,16 +278,16 @@ private:
       uint64_t mask = _pext_u64(chunks, 0x8080808080808080UL);
       if (sizeof(T) == 4 ||
           (chunks & 0x8080808080808080UL) != 0x8080808080808080UL) [[likely]] {
-        int32_t index = __tzcnt_u64(~mask);
+        // int32_t index = __tzcnt_u64(~mask);
         // difference = _pext_u64(chunks, extract_masks[index]);
-        difference =
-            _pext_u64(chunks, 0x7F7F7F7F7F7F7F7FUL) & extract_masks2[index];
         // difference =
-        //     _pext_u64(chunks, 0x7F7F7F7F7F7F7F7FUL) & extract_masks3[mask];
+        //     _pext_u64(chunks, 0x7F7F7F7F7F7F7F7FUL) & extract_masks2[index];
+        difference =
+            _pext_u64(chunks, 0x7F7F7F7F7F7F7F7FUL) & extract_masks3[mask];
         // assert(difference == (_pext_u64(chunks, 0x7F7F7F7F7F7F7F7FUL) &
         //                       extract_masks2[_mm_tzcnt_64(~mask)]));
-        // old_size = extract_masks4[mask];
-        old_size = index + 1;
+        old_size = extract_masks4[mask];
+        // old_size = index + 1;
         // assert(old_size == _mm_tzcnt_64(~mask) + 1);
         // printf("chunks = %lx, mask = %lx, index = %u, difference =%lu\n",
         //        chunks, mask, old_size, difference);
