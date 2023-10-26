@@ -2008,6 +2008,9 @@ uint64_t CPMA<traits>::find_containing_leaf_index(key_type e, uint64_t start,
   }
   assert((start * sizeof(key_type)) % logN() == 0);
   uint64_t size = (end - start) / elts_per_leaf();
+  if (size <= 1) {
+    return start;
+  }
   uint64_t logstep = bsr_long(size);
   uint64_t first_step = (size - (1UL << logstep));
 
