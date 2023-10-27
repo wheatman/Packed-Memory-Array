@@ -3821,7 +3821,6 @@ uint64_t CPMA<traits>::insert_batch(element_ptr_type e, uint64_t batch_size,
       timer double_timer("doubling");
       double_timer.start();
 
-      uint64_t target_size = N();
       uint64_t grow_times = 0;
       auto bytes_occupied = full_opt.value();
       assert(bytes_occupied < 1UL << 60UL);
@@ -3831,8 +3830,7 @@ uint64_t CPMA<traits>::insert_batch(element_ptr_type e, uint64_t batch_size,
       uint64_t bytes_required =
           std::max(N() * growing_factor, bytes_occupied * growing_factor);
 
-      while (target_size <= bytes_required) {
-        target_size *= growing_factor;
+      while (meta_data[meta_data_index + grow_times].n <= bytes_required) {
         grow_times += 1;
       }
 
@@ -4047,7 +4045,6 @@ uint64_t CPMA<traits>::remove_batch(key_type *e, uint64_t batch_size,
     if (full_opt.has_value()) {
       static_timer shrinking_timer("shrinking");
       shrinking_timer.start();
-      uint64_t target_size = N();
       uint64_t shrink_times = 0;
       auto bytes_occupied = full_opt.value();
 
@@ -4057,9 +4054,11 @@ uint64_t CPMA<traits>::remove_batch(key_type *e, uint64_t batch_size,
         bytes_required = 1;
       }
 
-      while (target_size >= bytes_required) {
-        target_size /= growing_factor;
+      while (meta_data[meta_data_index - shrink_times].n >= bytes_required) {
         shrink_times += 1;
+        if (meta_data_index == shrink_times) {
+          break;
+        }
       }
 
       shrink_list(shrink_times);
