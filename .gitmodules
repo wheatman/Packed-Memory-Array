@@ -13,3 +13,6 @@
 [submodule "StructOfArrays"]
 	path = StructOfArrays
 	url = git@github.com:wheatman/StructOfArrays.git
+[submodule "other_systems/rma"]
+	path = other_systems/rma
+	url = git@github.com:wheatman/rma.git
