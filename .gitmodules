@@ -16,3 +16,6 @@
 [submodule "other_systems/rma"]
 	path = other_systems/rma
 	url = git@github.com:wheatman/rma.git
+[submodule "other_systems/CPAM"]
+	path = other_systems/CPAM
+	url = git@github.com:wheatman/CPAM.git
