@@ -19,3 +19,6 @@
 [submodule "other_systems/CPAM"]
 	path = other_systems/CPAM
 	url = git@github.com:wheatman/CPAM.git
+[submodule "other_systems/aspen"]
+	path = other_systems/aspen
+	url = git@github.com:wheatman/aspen.git

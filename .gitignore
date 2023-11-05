@@ -9,6 +9,5 @@ del*
 data/
 *.csv
 *.out
-aspen/
 test_out/
 build/
