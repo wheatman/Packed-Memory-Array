@@ -80,6 +80,8 @@ The options are as follows, as a note some of the options are not fully supporte
 
 ## Compile
 
+This library requires some c++-20 support. It has been tested and works for g++ 11.4 and clang++ 14 and shold work for later ones as well.
+
 You will need to download the submodules with
 ```
 git submodule init
