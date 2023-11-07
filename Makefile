@@ -87,7 +87,7 @@ define get_build_rule
 
 build/basic_$(1)_$(2)_$(3): run.cpp include/PMA/internal/test.hpp include/PMA/internal/leaf.hpp include/PMA/CPMA.hpp
 	@mkdir -p build
-	$(CXX) $(CFLAGS) $(DEFINES) -DKEY_TYPE=$(1) -DLEAFFORM=$(2) -DHEADFORM=$(3)  $(LDFLAGS) -o build/basic_$(1)_$(2)_$(3) run.cpp
+	$(CXX) $(CFLAGS) $(DEFINES) -DKEY_TYPE=$(1) -DLEAFFORM=$(2) -DHEADFORM=$(3)  -o build/basic_$(1)_$(2)_$(3) run.cpp $(LDFLAGS)
 endef
 
 define get_build_rule_name
@@ -98,7 +98,7 @@ define get_build_soa_rule
 
 build/basic_soa_$(1)_$(2): run_soa.cpp include/PMA/internal/test_map.hpp include/PMA/internal/leaf.hpp include/PMA/CPMA.hpp
 	@mkdir -p build
-	$(CXX) $(CFLAGS) $(DEFINES) -DKEY_TYPE=$(1) -DHEADFORM=$(2)  $(LDFLAGS) -o build/basic_soa_$(1)_$(2) run_soa.cpp
+	$(CXX) $(CFLAGS) $(DEFINES) -DKEY_TYPE=$(1) -DHEADFORM=$(2)   -o build/basic_soa_$(1)_$(2) run_soa.cpp $(LDFLAGS)
 endef
 
 define get_build_soa_rule_name
@@ -185,7 +185,7 @@ test : $(foreach leaf_form,$(leaf_forms),$(foreach key_type,$(key_types),$(forea
 
 
 soa : run_soa.cpp leaf.hpp CPMA.hpp StructOfArrays/soa.hpp
-	$(CXX) $(CFLAGS) $(DEFINES)  $(LDFLAGS) -o soa run_soa.cpp
+	$(CXX) $(CFLAGS) $(DEFINES)   -o soa run_soa.cpp $(LDFLAGS)
  
 
 
