@@ -8,7 +8,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#ifdef __AVX2__
 #include <immintrin.h>
+#endif
 #include <iostream>
 #include <iterator>
 #include <limits>
@@ -4969,8 +4971,8 @@ bool CPMA<traits>::parallel_map(F f) const {
   }
   if (total_leaves() > 100) {
     ParallelTools::parallel_for(
-      0, total_leaves(),
-      [&](uint64_t idx) { get_leaf(idx).template map<true, F>(f); }
+        0, total_leaves(),
+        [&](uint64_t idx) { get_leaf(idx).template map<true, F>(f); }
 
     );
   } else {
@@ -5034,8 +5036,8 @@ void CPMA<traits>::serial_map_with_hint_par(
   if (leaf_number < leaf_number_end) {
     if (leaf_number_end - leaf_number > 50) {
       ParallelTools::parallel_for(
-        leaf_number, leaf_number_end,
-        [&](uint64_t idx) { get_leaf(idx).template map<no_early_exit, F>(f); }
+          leaf_number, leaf_number_end,
+          [&](uint64_t idx) { get_leaf(idx).template map<no_early_exit, F>(f); }
 
       );
     } else {

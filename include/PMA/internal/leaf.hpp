@@ -12,7 +12,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#ifdef __AVX2__
 #include <immintrin.h>
+#endif
 #include <limits>
 #include <malloc.h>
 #include <tuple>
@@ -169,7 +171,7 @@ private:
         0b111111111111111111111111111111111111111111UL,
         0b1111111111111111111111111111111111111111111111111UL,
         0b11111111111111111111111111111111111111111111111111111111UL};
-      static constexpr std::array<uint64_t, 9> extract_masks2_ = {
+    static constexpr std::array<uint64_t, 9> extract_masks2_ = {
         0,
         0b1111111UL,
         0b11111111111111UL,
@@ -3813,6 +3815,7 @@ public:
     }
     return false;
   }
+#ifdef __AVX512F__
 
   template <bool head_in_place = false> [[nodiscard]] __m512i sum512() const {
     static_assert(
@@ -3834,7 +3837,8 @@ public:
     }
     return a;
   }
-
+#endif
+#ifdef __AVX2__
   template <bool head_in_place = false>
   [[nodiscard]] __m256i sum32_256() const {
     static_assert(
@@ -3858,7 +3862,7 @@ public:
     a = _mm256_add_epi64(a, _mm256_loadu_epi64(arr + 27));
     return a;
   }
-
+#endif
   key_type last() const {
     element_type last_elem = head;
     for (uint64_t i = 0; i < length_in_elements; i++) {

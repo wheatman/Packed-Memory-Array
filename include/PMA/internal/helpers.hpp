@@ -6,7 +6,9 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#ifdef __AVX2__
 #include <immintrin.h>
+#endif
 #include <iostream>
 #include <iterator>
 #include <limits>
@@ -98,29 +100,23 @@ public:
 };
 } // namespace std
 
+#ifdef __AVX2__
 // find index of first 1-bit (least significant bit)
 static inline uint32_t bsf_word(uint32_t word) {
   uint32_t result;
   __asm__("bsf %1, %0" : "=r"(result) : "r"(word));
   return result;
 }
-
-static inline long bsf_long(long word) {
-  long result;
-  __asm__("bsfq %1, %0" : "=r"(result) : "r"(word));
-  return result;
-}
-
-static inline int bsr_word(int word) {
-  int result;
-  __asm__("bsr %1, %0" : "=r"(result) : "r"(word));
-  return result;
-}
+#endif
 
 static inline uint64_t bsr_long(uint64_t word) {
+#ifdef __AVX2__
   long result;
   __asm__("bsrq %1, %0" : "=r"(result) : "r"(word));
   return static_cast<uint64_t>(result);
+#else
+  return 63 - __builtin_clzl(word);
+#endif
 }
 
 static constexpr uint64_t bsr_long_constexpr(uint64_t word) {
