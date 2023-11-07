@@ -3,22 +3,22 @@
 	url = https://github.com/ParAlg/parlaylib.git
 [submodule "ParallelTools"]
 	path = ParallelTools
-	url = git@github.com:wheatman/ParallelTools.git
+	url = https://github.com/wheatman/ParallelTools.git
 [submodule "EdgeMapVertexMap"]
 	path = EdgeMapVertexMap
-	url = git@github.com:wheatman/EdgeMapVertexMap.git
+	url = https://github.com/wheatman/EdgeMapVertexMap.git
 [submodule "tlx"]
 	path = tlx
 	url = https://github.com/tlx/tlx.git
 [submodule "StructOfArrays"]
 	path = StructOfArrays
-	url = git@github.com:wheatman/StructOfArrays.git
+	url = https://github.com/wheatman/StructOfArrays.git
 [submodule "other_systems/rma"]
 	path = other_systems/rma
-	url = git@github.com:wheatman/rma.git
+	url = https://github.com/wheatman/rma.git
 [submodule "other_systems/CPAM"]
 	path = other_systems/CPAM
-	url = git@github.com:wheatman/CPAM.git
+	url = https://github.com/wheatman/CPAM.git
 [submodule "other_systems/aspen"]
 	path = other_systems/aspen
-	url = git@github.com:wheatman/aspen.git
+	url = https://github.com/wheatman/aspen.git
