@@ -23,7 +23,7 @@ $(warning sorting and thus batch inserts is much faster with vqsort)
 endif
 
 
-CFLAGS := -Wall -Wextra -O$(OPT)  -std=c++20 -Iinclude -IParallelTools/ -Itlx/ -Wno-deprecated-declarations -Iparlaylib/include/ -IStructOfArrays/include/ -IEdgeMapVertexMap/include/ -ferror-limit=1 -Wshadow
+CFLAGS := -Wall -Wextra -O$(OPT)  -std=c++20 -Iinclude -IParallelTools/ -Itlx/ -Wno-deprecated-declarations -Iparlaylib/include/ -IStructOfArrays/include/ -IEdgeMapVertexMap/include/ -Wshadow
 
 ifeq ($(DEBUG_SYMBOLS),1)
 CFLAGS += -g -gdwarf-4
