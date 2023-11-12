@@ -11,3 +11,5 @@ data/
 *.out
 test_out/
 build/
+*.adj
+*.pdf
