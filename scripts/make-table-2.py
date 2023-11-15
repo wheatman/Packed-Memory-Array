@@ -4,9 +4,9 @@ import csv
 import matplotlib.pyplot as plt
 import numpy as np
 
-num_entries = 3 # TODO: update later with bigger test
-num_elts = 1000
-batch_sizes = [1, 10, 100]
+num_entries = 8
+num_elts = 1e8
+batch_sizes = [1, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7]
 pma_serial_times = [0] * num_entries
 cpma_serial_times = [0] * num_entries
 pma_parallel_times = [0] * num_entries
@@ -23,17 +23,6 @@ with open('outputs/pma_serial_batch.out', newline='') as csvfile:
 print('pma serial times')
 print(pma_serial_times)
 
-'''
-# read CPMA times
-with open('outputs/cpma_serial_batch.out', newline='') as csvfile:
-    reader = csv.reader(csvfile, delimiter=',')
-    idx = 0
-    for row in reader:
-        cpma_serial_times[idx] = float(row[1]) / 1e6
-        idx = idx + 1
-print('cpma serial times')
-print(cpma_serial_times)
-'''
 with open('outputs/pma_parallel_batch.out', newline='') as csvfile:
     reader = csv.reader(csvfile, delimiter=',')
     idx = 0
@@ -43,28 +32,13 @@ with open('outputs/pma_parallel_batch.out', newline='') as csvfile:
 print('pma parallel times')
 print(pma_parallel_times)
 
-'''
-# read CPMA times
-with open('outputs/cpma_parallel_batch.out', newline='') as csvfile:
-    reader = csv.reader(csvfile, delimiter=',')
-    idx = 0
-    for row in reader:
-        cpma_parallel_times[idx] = float(row[1]) / 1e6
-        idx = idx + 1
-print('cpma parallel times')
-print(cpma_parallel_times)
-'''
 # calculate throughputs
 pma_serial_throughputs = [0] * num_entries
-#cpma_serial_throughputs = [0] * num_entries
 pma_parallel_throughputs = [0] * num_entries
-#cpma_parallel_throughputs = [0] * num_entries
 
 for i in range(0, num_entries):
     pma_serial_throughputs[i] = num_elts / pma_serial_times[i]
-    #cpma_serial_throughputs = num_elts / cpma_serial_times[i]
     pma_parallel_throughputs[i] = num_elts / pma_parallel_times[i]
-    #cpma_parallel_throughputs = num_elts / cpma_parallel_times[i]
 
 # remove anything slower than serial point
 for i in range(1, num_entries):

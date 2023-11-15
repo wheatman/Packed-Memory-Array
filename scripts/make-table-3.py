@@ -4,7 +4,7 @@ import csv
 import matplotlib.pyplot as plt
 import numpy as np
 
-num_entries = 4 # TODO: update later with bigger test
+num_entries = 4
 num_elts = 1e8
 batch_sizes = [1e4, 1e5, 1e6, 1e7]
 pma_serial_times = [0] * num_entries

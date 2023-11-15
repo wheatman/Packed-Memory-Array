@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 num_entries = 4
-num_elts = [100, 1000, 10000, 100000] # update later with real numbers
+num_elts = [1e6, 1e7, 1e8, 1e9]
 
 # sizes are all in bytes / elt
 pma_sizes = [0] * num_entries

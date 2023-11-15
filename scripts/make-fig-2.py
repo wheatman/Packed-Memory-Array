@@ -5,15 +5,16 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 # TODO: update num_* later for bigger test
-num_entries = 10
-num_elts = 1000
-num_queries = 100
+num_entries = 21
+num_elts = 100000000
+num_queries = 100000
 universe_size = 2**40
+start_range_size = 14 # 2^14 = 16384
 
 range_sizes = [0] * num_entries
 exp_finds_per_search = [0] * num_entries
 exp_finds_total = [0] * num_entries
-for i in range(0, num_entries):
+for i in range(start_range_size, num_entries):
     range_sizes[i] = 2**i
     exp_finds_per_search[i] = (num_elts * range_sizes[i])/universe_size
     exp_finds_total[i] = exp_finds_per_search[i] * num_queries
@@ -24,13 +25,17 @@ cpac_times = [0] * num_entries
 pma_times = [0] * num_entries
 cpma_times = [0] * num_entries
 
-# make the CSV
+# TODO: make this ignore the small points with expected finds < 1
+# probably something like 
+# for row: if idx < start_range_size: continue else: add it to the list of times
 # read PMA times
 with open('outputs/pma_parallel_map_range.out', newline='') as csvfile:
     reader = csv.reader(csvfile, delimiter=' ')
     idx = 0
     for row in reader:
-        pma_times[idx] = float(row[-1])
+        if idx >= start_range_size:
+            print(row)
+            pma_times[idx - start_range_size] = float(row[-1])
         idx = idx + 1
 print('pma times')
 print(pma_times)
@@ -40,11 +45,15 @@ with open('outputs/cpma_parallel_map_range.out', newline='') as csvfile:
     reader = csv.reader(csvfile, delimiter=' ')
     idx = 0
     for row in reader:
-        cpma_times[idx] = float(row[-1])
+        if idx >= start_range_size:
+            cpma_times[idx] = float(row[-1])
         idx = idx + 1
+
 print('cpma times')
 print(cpma_times)
 
+
+# read pam / cpam times
 with open('../other_systems/CPAM/examples/microbenchmarks/outputs/pam_parallel_map_range.out') as csvfile:
     reader = csv.reader(csvfile, delimiter=',')
     idx = 0
