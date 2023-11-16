@@ -4,9 +4,13 @@ mkdir -p outputs
 mkdir -p csvs
 mkdir -p plots
 
-N=1000 # should be 100M
+N=100000000 # should be 100M
 R=100000
-RANGE=128 # should eventually become 2^32 = 17179869184
+RANGE=17179869184 # should eventually become 2^32 = 17179869184
+
+# N=1000 # should be 100M
+# R=100000
+# RANGE=128 # should eventually become 2^32 = 17179869184
 
 for THREADS in 2 4 8 16 32 64 128
 do

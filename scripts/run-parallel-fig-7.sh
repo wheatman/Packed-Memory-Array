@@ -4,9 +4,9 @@ mkdir -p outputs
 mkdir -p csvs
 mkdir -p plots
 
-N=1000
-BATCH=100
-logN=3 
+N=100000000 # N=1000
+BATCH=1000000 # BATCH=100
+
 for THREADS in 2 4 8 16 32 64 128
 do
 	# uncompressed PMA batch inserts
