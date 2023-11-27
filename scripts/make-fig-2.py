@@ -14,10 +14,13 @@ start_range_size = 14 # 2^14 = 16384
 range_sizes = [0] * num_entries
 exp_finds_per_search = [0] * num_entries
 exp_finds_total = [0] * num_entries
-for i in range(start_range_size, num_entries):
-    range_sizes[i] = 2**i
+for i in range(0, num_entries):
+    range_idx = i + start_range_size
+    range_sizes[i] = 2**range_idx
     exp_finds_per_search[i] = (num_elts * range_sizes[i])/universe_size
     exp_finds_total[i] = exp_finds_per_search[i] * num_queries
+print(exp_finds_per_search)
+print(exp_finds_total)
 
 pam_times = [0] * num_entries
 upac_times = [0] * num_entries
@@ -34,7 +37,6 @@ with open('outputs/pma_parallel_map_range.out', newline='') as csvfile:
     idx = 0
     for row in reader:
         if idx >= start_range_size:
-            print(row)
             pma_times[idx - start_range_size] = float(row[-1])
         idx = idx + 1
 print('pma times')
@@ -46,7 +48,7 @@ with open('outputs/cpma_parallel_map_range.out', newline='') as csvfile:
     idx = 0
     for row in reader:
         if idx >= start_range_size:
-            cpma_times[idx] = float(row[-1])
+            cpma_times[idx - start_range_size] = float(row[-1])
         idx = idx + 1
 
 print('cpma times')
@@ -58,7 +60,6 @@ with open('../other_systems/CPAM/examples/microbenchmarks/outputs/pam_parallel_m
     reader = csv.reader(csvfile, delimiter=',')
     idx = 0
     for row in reader:
-        print(row)
         pam_times[idx] = float(row[0])
         idx = idx + 1
 
@@ -125,4 +126,5 @@ with open('./csvs/map_range_micro.csv', 'w', newline='') as file:
         pma = pma_throughputs[i]
         cpac = cpac_throughputs[i]
         cpma = cpma_throughputs[i]
+
         writer.writerow([str(finds_per_search), str(int(pam)), str(int(upac)), str(int(pma)), "{:.2f}".format(pma/pam),"{:.2f}".format(pma/upac), str(int(cpac)), str(int(cpma)), "{:.2f}".format(cpma/cpac), "{:.2f}".format(cpma/pma)])
