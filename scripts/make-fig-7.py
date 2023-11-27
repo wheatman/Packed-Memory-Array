@@ -4,10 +4,8 @@ import csv
 import matplotlib.pyplot as plt
 import numpy as np
 
-# TODO: update num_* later for bigger test
 num_entries = 8
-num_elts = 1000
-num_queries = 100
+num_elts = 100000000
 
 num_threads = [0] * num_entries
 for i in range(0, num_entries):
@@ -55,6 +53,7 @@ print('cpma scaling')
 print(cpma_scaling)
 
 # plot it
+print(num_threads)
 plt.xscale("log", base=2)
 plt.xlabel("Cores")
 plt.ylabel("Speedup")

@@ -4,11 +4,10 @@ import csv
 import matplotlib.pyplot as plt
 import numpy as np
 
-# TODO: update num_* later for bigger test
 num_entries = 8
-num_elts = 1000 #will become 100M
+num_elts = 100000000 #will become 100M
 num_queries = 100000
-range_size = 128 # will become 2^34
+range_size = 17179869184 # will become 2^34
 universe_size = 2**40
 
 num_threads = [0] * num_entries
