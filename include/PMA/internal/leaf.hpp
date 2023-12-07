@@ -15,6 +15,7 @@
 #ifdef __AVX2__
 #include <immintrin.h>
 #endif
+#include <bit>
 #include <limits>
 #include <malloc.h>
 #include <tuple>
@@ -280,17 +281,17 @@ private:
       uint64_t mask = _pext_u64(chunks, 0x8080808080808080UL);
       if (sizeof(T) == 4 ||
           (chunks & 0x8080808080808080UL) != 0x8080808080808080UL) [[likely]] {
-        // int32_t index = __tzcnt_u64(~mask);
+        // int32_t index = std::countr_zero(~mask);
         // difference = _pext_u64(chunks, extract_masks[index]);
         // difference =
         //     _pext_u64(chunks, 0x7F7F7F7F7F7F7F7FUL) & extract_masks2[index];
         difference =
             _pext_u64(chunks, 0x7F7F7F7F7F7F7F7FUL) & extract_masks3[mask];
         // assert(difference == (_pext_u64(chunks, 0x7F7F7F7F7F7F7F7FUL) &
-        //                       extract_masks2[_mm_tzcnt_64(~mask)]));
+        //                       extract_masks2[std::countr_zero(~mask)]));
         old_size = extract_masks4[mask];
         // old_size = index + 1;
-        // assert(old_size == _mm_tzcnt_64(~mask) + 1);
+        // assert(old_size == std::countr_zero(~mask) + 1);
         // printf("chunks = %lx, mask = %lx, index = %u, difference =%lu\n",
         //        chunks, mask, old_size, difference);
         return;
@@ -323,7 +324,7 @@ private:
       uint64_t chunks = unaligned_load<uint64_t>(loc);
       if (sizeof(T) == 4 ||
           (chunks & 0x8080808080808080UL) != 0x8080808080808080UL) [[likely]] {
-        int32_t index = __tzcnt_u64(mask);
+        int32_t index = std::countr_zero(mask);
         difference =
             _pext_u64(chunks, 0x7F7F7F7F7F7F7F7FUL) & extract_masks2[index];
         old_size = index + 1;
@@ -2135,7 +2136,7 @@ public:
 
       if (uint32_t set_bit_mask = (data ^ (data >> 1U)) ^ (data | (data >> 1U));
           set_bit_mask) {
-        size_t ret = curr_loc + bsf_word(set_bit_mask);
+        size_t ret = curr_loc + std::countr_zero(set_bit_mask);
         ASSERT(ret == used_size_simple<head_in_place>(),
                "ret = %lu, correct = %lu\n", ret,
                used_size_simple<head_in_place>());
@@ -2159,7 +2160,7 @@ public:
           if (data == 0xFFFFFFFFUL) {
             ret = curr_loc - last_bit;
           } else {
-            ret = curr_loc + bsf_word(set_bit_mask);
+            ret = curr_loc + std::countr_zero(set_bit_mask);
           }
           ASSERT(ret == used_size_simple<head_in_place>(),
                  "ret = %lu, correct = %lu\n", ret,
@@ -2212,7 +2213,7 @@ public:
 
       if (uint32_t set_bit_mask = (data ^ (data >> 1U)) ^ (data | (data >> 1U));
           set_bit_mask) {
-        size_t ret = aligned_start + bsf_word(set_bit_mask);
+        size_t ret = aligned_start + std::countr_zero(set_bit_mask);
         ASSERT(ret == used_size_simple<head_in_place>(),
                "ret = %lu, correct = %lu\n", ret,
                used_size_simple<head_in_place>());
@@ -2232,7 +2233,7 @@ public:
           if (data == 0xFFFFFFFFUL) {
             ret = curr_loc - last_bit;
           } else {
-            ret = curr_loc + bsf_word(set_bit_mask);
+            ret = curr_loc + std::countr_zero(set_bit_mask);
           }
           ASSERT(ret == used_size_simple<head_in_place>(),
                  "ret = %lu, correct = %lu\n", ret,

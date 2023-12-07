@@ -386,16 +386,16 @@ static constexpr std::array<meta_data_t, 256> get_metadata_table() {
 
   std::array<meta_data_t, 256> res = {{}};
   uint64_t n = traits::min_leaf_size;
-  uint64_t lln = bsr_long_constexpr(bsr_long_constexpr(n));
+  uint64_t lln = bsr_long(bsr_long(n));
   uint64_t ln = traits::leaf_blow_up_factor * (1UL << lln);
   if (n < ln) {
     n = ln;
-    lln = bsr_long_constexpr(bsr_long_constexpr(n));
+    lln = bsr_long(bsr_long(n));
   }
 
   while (n % ln != 0) {
     n += ln - (n % ln);
-    lln = bsr_long_constexpr(bsr_long_constexpr(n));
+    lln = bsr_long(bsr_long(n));
     ln = traits::leaf_blow_up_factor * (1UL << lln);
   }
   uint64_t total_leaves = n / ln;
@@ -405,7 +405,7 @@ static constexpr std::array<meta_data_t, 256> get_metadata_table() {
         PMA_precalculate::calculate_num_leaves_rounded_up<traits>(total_leaves);
   }
 
-  uint64_t H = bsr_long_constexpr(total_leaves);
+  uint64_t H = bsr_long(total_leaves);
 
   uint64_t i = 0;
   res[i] = {
@@ -445,15 +445,20 @@ static constexpr std::array<meta_data_t, 256> get_metadata_table() {
     } else {
       n = desired_new_size;
     }
-    lln = bsr_long_constexpr(bsr_long_constexpr(n));
+    lln = bsr_long(bsr_long(n));
     ln = traits::leaf_blow_up_factor * (1UL << lln);
     while (n % ln != 0) {
       n += ln - (n % ln);
-      lln = bsr_long_constexpr(bsr_long_constexpr(n));
+      if (n == 0) {
+        lln = 0;
+      } else {
+        lln = bsr_long(bsr_long(n));
+      }
+
       ln = traits::leaf_blow_up_factor * (1U << lln);
     }
     total_leaves = n / ln;
-    H = bsr_long_constexpr(total_leaves);
+    H = bsr_long(total_leaves);
     if constexpr (traits::head_form == Eytzinger ||
                   traits::head_form == BNary) {
       total_leaves_rounded_up =

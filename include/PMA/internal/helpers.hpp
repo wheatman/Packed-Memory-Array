@@ -3,6 +3,7 @@
 
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -100,49 +101,12 @@ public:
 };
 } // namespace std
 
-#ifdef __AVX2__
-// find index of first 1-bit (least significant bit)
-static inline uint32_t bsf_word(uint32_t word) {
-  uint32_t result;
-  __asm__("bsf %1, %0" : "=r"(result) : "r"(word));
-  return result;
-}
-#endif
-
-static inline uint64_t bsr_long(uint64_t word) {
-#ifdef __AVX2__
-  long result;
-  __asm__("bsrq %1, %0" : "=r"(result) : "r"(word));
-  return static_cast<uint64_t>(result);
-#else
-  return 63 - __builtin_clzl(word);
-#endif
+static constexpr uint64_t bsr_long(uint64_t word) {
+  return 63 - std::countl_zero(word);
 }
 
-static constexpr uint64_t bsr_long_constexpr(uint64_t word) {
-  if (word == 0) {
-    return 0;
-  }
-  if (word & (1UL << 63U)) {
-    return 63;
-  } else {
-    return bsr_long_constexpr(word << 1UL) - 1;
-  }
-}
-
-static inline bool power_of_2(uint64_t word) {
-  return __builtin_popcountll(word) == 1;
-}
 static constexpr inline uint64_t nextPowerOf2(uint64_t n) {
-  n--;
-  n |= n >> 1UL;
-  n |= n >> 2UL;
-  n |= n >> 4UL;
-  n |= n >> 8UL;
-  n |= n >> 16UL;
-  n |= n >> 32UL;
-  n++;
-  return n;
+  return std::bit_ceil(n);
 }
 
 //#define ENABLE_TRACE_TIMER
@@ -226,20 +190,8 @@ template <class T> inline void Log(const __m128i &value) {
 }
 #endif
 
-static uint64_t tzcnt(uint64_t num) {
-#ifdef __BMI__
-  return _tzcnt_u64(num);
-#endif
-  uint64_t count = 0;
-  while ((num & 1U) == 0) {
-    count += 1;
-    num >>= 1U;
-  }
-  return count;
-}
-
 [[nodiscard]] inline uint64_t e_index(uint64_t index, uint64_t length) {
-  uint64_t pos_0 = tzcnt(~index) + 1;
+  uint64_t pos_0 = std::countr_zero(~index) + 1;
   uint64_t num_bits = bsr_long(length) + 1;
   return (1UL << (num_bits - pos_0)) + (index >> pos_0) - 1;
 }
