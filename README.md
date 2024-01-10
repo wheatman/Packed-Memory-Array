@@ -10,6 +10,9 @@ It contains 3 major optimizations.
 
 This README file is broken into two parts, the first is using the Packed Memory Array in general and as part of other systems.  The second is how to run specific benchmarks that were used to test and evaluate the behavior of the PMA, CPMA, and SPMA.
 
+### PPoPP artifact evaluation
+To run experiments for the PPoPP artifact, follow the documentation in CPMA artifact readme.pdf
+
 ## Using the different variants of PMA's
 The library itself is header only, so you can just `#include` "[CPMA.h](include/PMA/CPMA.hpp)".  
 
