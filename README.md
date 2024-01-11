@@ -187,7 +187,7 @@ basic_uint64_t_delta_compressed_Eytzinger graph <path to graph> <trials> <start_
 
 ### Tests for CPMA
 
-#### Batch Insert throughput (Figure 1, Table 3, Table 6)
+#### Batch Insert/Delete throughput (Figure 1, Table 3, Table 4)
 
 First you need to build the PMA with 
 ```
@@ -205,13 +205,17 @@ make build/basic_uint64_t_delta_compressed_Eytzinger PARLAY=1 -B
 ./build/basic_uint64_t_delta_compressed_Eytzinger batch_bench <num_elements_start>
 ```
 
-To get the serial numbers rebuild with the flag `PARLAY=1` and run the test again
+To get the serial numbers rebuild without the flag `PARLAY=1` and run the test again
 
 ```
 make build/basic_uint64_t_uncompressed_Eytzinger -B
 ./build/basic_uint64_t_uncompressed_Eytzinger batch_bench <num_elements_start>
 ```
 
+The above tests will run with 40 bit uniform random numbers.  You can also test a zipfian distribution for a skewed input distribution by using the command
+```
+./build/basic_uint64_t_uncompressed_Eytzinger batch_bench_zip <num_elements_start> <trials> <verify> <alpha>
+```
 
 
 #### Range query throughput (Figure 2)
@@ -288,14 +292,14 @@ basic_uint64_t_uncompressed_Eytzinger map_range_single <num_elements_start = 100
 ```
 
 
-#### Space usage (Table 4)
+#### Space usage (Table 5)
 
 The space usage will print out after some of the tests.  The best one to use is the single insertion tests.  Due to the amortized nature of the structure it is possible that depending on the insertion pattern the structure will be slightly different sizes depending on how the elements were inserted, hence recommending using the single insert test to build the structure to measure size.  The command is 
 ```
 ./build/basic_uint64_t_uncompressed_Eytzinger single <num elements>
 ```
 
-#### Running Graph Algorithms and insert (Figure 9, Figure 10, Table 5)
+#### Running Graph Algorithms and insert (Figure 9, Figure 10, Table 6)
 Graph Algorithms can be run with
 ```
 ./build/basic_uint64_t_delta_compressed_Eytzinger graph <path to graph> <trials> <start_node> <max batch to insert>
@@ -304,7 +308,7 @@ Graph Algorithms can be run with
 This will print out the size of the graph, how long it took to run the different algorithms, and how long it took to perform batch inserts into it.
 
 
-### RMA batch insert experiment
+### RMA batch insert experiment (Table 3)
 
 The serial batch insert experiments for RMA can be run with `other_systems/rma/batch_insert.sh`
 
@@ -316,7 +320,7 @@ echo 1 > /proc/sys/vm/overcommit_memory
 No other parts of the evaluation require any sort of privilege access.
 
 
-### Micro benchmarks for C-Pac U-Pac and PAM (Figure 1, Figure 2, Table 4, Table 6, Table 7)
+### Micro benchmarks for C-Pac U-Pac and PAM (Figure 1, Figure 2, Table 5, Table 8, Table 9)
 
 To run the tests for U-Pac and C-Pac cd into `other_systems/CPAM/examples/microbenchmarks`
 the run run_tests.sh
