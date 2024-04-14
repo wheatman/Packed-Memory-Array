@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ranges>
 #ifdef __AVX2__
 #include <immintrin.h>
 #endif
@@ -548,17 +549,21 @@ public:
   // Output: returns a tuple (ptr to where this merge stopped in the batch,
   // number of distinct elements merged in, and number of bytes used in this
   // leaf)
-  template <bool head_in_place, bool parallel,
-            typename ValueUpdate = std::nullptr_t>
+  template <bool head_in_place, bool parallel, typename ValueUpdate,
+            bool maintain_offsets>
   std::tuple<element_ptr_type, uint64_t, uint64_t>
-  merge_into_leaf(element_ptr_type batch_start_, T *batch_end,
-                  uint64_t end_val) {
+  merge_into_leaf(element_ptr_type batch_start_, T *batch_end, uint64_t end_val,
+                  [[maybe_unused]] ValueUpdate value_update,
+                  [[maybe_unused]] auto offsets_array) {
+    static_assert(!maintain_offsets);
     T *batch_start = batch_start_.get_pointer();
     // TODO(wheatman) deal with the case where end_val == max_uint and you still
     // want to add the last element
     //  case 1: only one element from the batch goes into the leaf
     if (batch_start + 1 == batch_end || batch_start[1] >= end_val) {
-      auto [inserted, byte_count] = insert<head_in_place>(*batch_start);
+      auto [inserted, byte_count] =
+          insert<head_in_place, ValueUpdate, maintain_offsets>(
+              *batch_start, value_update, offsets_array);
       return {batch_start + 1, inserted, byte_count};
     }
 
@@ -838,7 +843,8 @@ public:
     // want to add the last element
     //  case 1: only one element from the batch goes into the leaf
     if (batch_start + 1 == batch_end || batch_start[1] >= end_val) {
-      auto [removed, byte_count] = remove<head_in_place>(*batch_start);
+      auto [removed, byte_count] =
+          remove<head_in_place, false>(*batch_start, nullptr);
       return {batch_start + 1, removed, byte_count};
     }
 
@@ -1485,14 +1491,17 @@ public:
   }
 
   template <bool head_in_place, bool store_densities, bool support_rank,
-            bool parallel, typename F, typename density_array_type,
-            typename rank_tree_array_type>
+            bool parallel, bool maintain_offsets, typename F,
+            typename density_array_type, typename rank_tree_array_type,
+            typename offsets_array_type>
   void split(const uint64_t num_leaves, const uint64_t num_occupied_bytes,
              const uint64_t bytes_per_leaf, element_ptr_type dest_region_,
              uint64_t leaf_start_index, F index_to_head,
              density_array_type density_array,
              [[maybe_unused]] rank_tree_array_type rank_tree_array,
-             [[maybe_unused]] uint64_t total_leaves) {
+             [[maybe_unused]] uint64_t total_leaves,
+             [[maybe_unused]] offsets_array_type offsets_array) {
+    static_assert(!maintain_offsets);
     ASSERT(used_size_simple<head_in_place>() ==
                num_occupied_bytes - ((head_in_place) ? 0 : sizeof(T)),
            "used_size_simple() == %lu, num_occupied_bytes - ((head_in_place) ? "
@@ -1680,8 +1689,11 @@ public:
   // inserts an element
   // first return value indicates if something was inserted
   // if something was inserted the second value tells you the current size
-  template <bool head_in_place, typename ValueUpdate = std::nullptr_t>
-  std::pair<bool, size_t> insert(element_type x_) {
+  template <bool head_in_place, typename ValueUpdate, bool maintain_offsets>
+  std::pair<bool, size_t> insert(element_type x_,
+                                 [[maybe_unused]] ValueUpdate value_update,
+                                 [[maybe_unused]] auto offsets_array) {
+    static_assert(!maintain_offsets);
     key_type x = std::get<0>(x_);
     if constexpr (head_in_place) {
       // used_size counts the head, length in bytes does not
@@ -1749,7 +1761,9 @@ public:
   // removes an element
   // first return value indicates if something was removed
   // if something was removed the second value tells you the current size
-  template <bool head_in_place> std::pair<bool, size_t> remove(T x) {
+  template <bool head_in_place, bool maintain_offsets>
+  std::pair<bool, size_t> remove(T x, [[maybe_unused]] auto offsets_array) {
+    static_assert(!maintain_offsets);
     if (head == 0 || x < head) {
       return {false, 0};
     }
@@ -2598,12 +2612,12 @@ public:
   // Output: returns a tuple (ptr to where this merge stopped in the batch,
   // number of distinct elements merged in, and number of bytes used in this
   // leaf)
-  template <bool head_in_place, bool parallel,
-            typename ValueUpdate = std::nullptr_t>
+  template <bool head_in_place, bool parallel, typename ValueUpdate,
+            bool maintain_offsets>
   std::tuple<element_ptr_type, uint64_t, uint64_t>
   merge_into_leaf(element_ptr_type batch_start, T *batch_end, uint64_t end_val,
-                  ValueUpdate value_update = {}) {
-
+                  ValueUpdate value_update, auto offsets_array) {
+    static_assert(!maintain_offsets);
     static_assert(
         binary ||
             std::is_invocable_v<ValueUpdate, element_ref_type, element_type>,
@@ -2622,7 +2636,8 @@ public:
     if (batch_start.get_pointer() + 1 == batch_end ||
         batch_start.template get<0>(1) >= end_val) {
       auto [inserted, byte_count] =
-          insert<head_in_place, ValueUpdate>(*batch_start);
+          insert<head_in_place, ValueUpdate, maintain_offsets>(
+              *batch_start, ValueUpdate(), offsets_array);
 
       return {batch_start + 1, inserted, byte_count};
     }
@@ -2839,6 +2854,298 @@ public:
                 ((head_in_place) ? 0 : sizeof(T)) /* for the head*/};
   }
 
+  // this differs from above in that it knows how to deal with sentinals and
+  // different nodes regions
+  template <bool head_in_place, bool parallel, typename ValueUpdate,
+            bool maintain_offsets, std::ranges::random_access_range R,
+            class element_func>
+  std::tuple<int64_t, uint64_t, uint64_t>
+  merge_into_leaf_pcsr(R &es_raw, element_func f, key_type this_head_src,
+                       key_type next_head_src, key_type next_head_dest,
+                       ValueUpdate value_update, auto &offsets_array) {
+    // this leaf can't be empty or external
+    assert(head_key() != 0);
+    assert(array.get(length_in_elements - 1) == 0);
+
+    auto es = std::ranges::transform_view(
+        es_raw, [&](const auto &element) { return f(element); });
+
+#if DEBUG == 1
+    if (!check_increasing_or_zero<true>()) {
+      print();
+      assert(false);
+    }
+#endif
+    static constexpr T top_bit = (std::numeric_limits<T>::max() >> 1) + 1;
+    static_assert(maintain_offsets);
+    static_assert(
+        binary ||
+            std::is_invocable_v<ValueUpdate, element_ref_type, element_type>,
+        "the value update function must take in a reference to the "
+        "current value and the new value");
+    // make a tuple of src dest from the elements in the batch
+    auto b_tuple = [](const auto &element)
+        -> std::tuple<key_type, std::make_signed_t<key_type>> {
+      // we convert the dest to signed, this means that sentinals, who always
+      // have the first bit set will be less than all other elements in the same
+      // source
+      return {std::get<0>(element), std::get<1>(element)};
+    };
+
+    auto mark_inserted = [](auto &element) { std::get<0>(element) |= top_bit; };
+
+    auto b_value = [](const auto &element) {
+      if constexpr (binary) {
+        return std::get<1>(element);
+      } else {
+        static_assert(!binary);
+        return leftshift_tuple(element);
+      }
+    };
+    // make a tuple for the elements in the leaf
+    auto l_tuple = [](key_type src, key_type dest)
+        -> std::tuple<key_type, std::make_signed_t<key_type>> {
+      return {src, dest};
+    };
+
+    if (es.size() == 1 ||
+        b_tuple(es[1]) >= l_tuple(next_head_src, next_head_dest)) {
+      // if the batch size is 1 we never need to use extra space
+      // if we are inserting into the first and the head isn't a sentinal we can
+      // just call the standard function, since it will properly shift things to
+      // the right
+      const auto &elem = es[0];
+      if (this_head_src == std::get<0>(elem) &&
+          (head_key() < top_bit ||
+           head_key() >= (top_bit | (this_head_src + 1)))) {
+        auto [inserted, byte_count] =
+            insert<head_in_place, ValueUpdate, maintain_offsets>(
+                leftshift_tuple(elem), ValueUpdate(), offsets_array);
+        if (inserted) {
+          mark_inserted(es_raw[0]);
+        }
+        return {1, inserted, byte_count};
+      }
+      // else we need to find the start of our fake leaf
+      T my_sentinal = top_bit | std::get<0>(elem);
+      // this means the head is our sentinal
+      if (head_key() == my_sentinal) {
+        uncompressed_leaf l(*array, array + 1,
+                            (length_in_elements - 1) * sizeof(T));
+        auto [inserted, byte_count] =
+            l.template insert<true, ValueUpdate, maintain_offsets>(
+                leftshift_tuple(elem), ValueUpdate(), offsets_array);
+        // added since this function won't count the space used in the real
+        // leaf, just the fake one
+        if constexpr (head_in_place) {
+          byte_count += sizeof(T);
+        }
+        // std::cout << "insert 2\n";
+        if (inserted) {
+          mark_inserted(es_raw[0]);
+        }
+        return {1, inserted, byte_count};
+      }
+      // we loop through to find the correct sentinal
+      size_t offset = std::numeric_limits<size_t>::max();
+      for (uint64_t i = 0; i < length_in_elements; i++) {
+        if (array.get(i) == my_sentinal) {
+          offset = i;
+        }
+      }
+      assert(offset != std::numeric_limits<size_t>::max());
+      // offset would be the sentinal
+      //  offset+1 is the fake head
+      //  offset+2 is the fake data
+      uncompressed_leaf l(*(array + 1 + offset), array + 2 + offset,
+                          (length_in_elements - (2 + offset)) * sizeof(T));
+      auto [inserted, byte_count] =
+          l.template insert<true, ValueUpdate, maintain_offsets>(
+              leftshift_tuple(elem), ValueUpdate(), offsets_array);
+      // added since this function won't count the space used in the real
+      // leaf, just the fake one
+      byte_count += sizeof(T) * (offset + 1);
+      if constexpr (head_in_place) {
+        byte_count += sizeof(T);
+      }
+      // std::cout << "insert 3\n";
+      if (inserted) {
+        mark_inserted(es_raw[0]);
+      }
+      return {1, inserted, byte_count};
+    }
+
+    // we have more than one element and want to do a proper merge
+    // two-finger merge into extra space, might overflow leaf
+    uint64_t temp_size = length_in_elements;
+    // get enough size for the batch
+    while (temp_size < es.size() &&
+           b_tuple(es[temp_size]) <= l_tuple(next_head_src, next_head_dest)) {
+      temp_size *= 2;
+    }
+    temp_size += length_in_elements;
+    temp_size += 1;
+
+    void *temp_arr = malloc(SOA_type::get_size_static(temp_size));
+    element_ptr_type leaf_ptr = array;
+    auto temp_ptr = SOA_type::get_static_ptr(temp_arr, temp_size, 0);
+    const auto temp_arr_start = temp_ptr;
+
+    uint64_t distinct_batch_elts = 0;
+    uint64_t batch_index = 0;
+    T *leaf_end = array.get_pointer() + length_in_elements;
+    auto last_written = l_tuple(key_type(), key_type());
+
+    // merge into temp space
+    // everything that needs to go before the head
+
+    bool did_before_head = false;
+
+    // TODO(wheatman) do the parallel merge, though this case is only needed
+    // when you insert a constant fraction of the total elements to a single
+    // leaf
+    T leaf_src = this_head_src;
+
+    if (!did_before_head) {
+      while (batch_index < es.size() &&
+             b_tuple(es[batch_index]) < l_tuple(leaf_src, head_key())) {
+        // if duplicates in batch, skip
+        // zeros are handled someplace else
+        assert(std::get<1>(es[batch_index]) != 0);
+        if (b_tuple(es[batch_index]) == last_written) {
+          if constexpr (!binary) {
+            value_update((temp_ptr - 1)[0], b_value(es[batch_index]));
+          }
+          batch_index += 1;
+          continue;
+        }
+        *temp_ptr = b_value(es[batch_index]);
+        mark_inserted(es_raw[batch_index]);
+        batch_index += 1;
+        distinct_batch_elts++;
+        last_written = {leaf_src, temp_ptr.get()};
+        ++temp_ptr;
+      }
+    }
+
+    if constexpr (!binary) {
+      // if we are not binary merge, then we could have gotten a new value for
+      // the head
+      if (batch_index < es.size() &&
+          b_tuple(es[batch_index]) == l_tuple(leaf_src, head_key())) {
+        value_update(head, b_value(es[batch_index]));
+        batch_index += 1;
+      }
+    }
+
+    // deal with the head
+    temp_ptr.set(head);
+    last_written = {leaf_src, std::get<0>(head)};
+    ++temp_ptr;
+
+    // the standard merge
+    while (batch_index < es.size() &&
+           b_tuple(es[batch_index]) < l_tuple(next_head_src, next_head_dest) &&
+           leaf_ptr.get_pointer() < leaf_end && leaf_ptr.get() > 0) {
+      // if duplicates in batch, skip
+      if (b_tuple(es[batch_index]) == last_written) {
+        if constexpr (!binary) {
+          value_update((temp_ptr - 1)[0], b_value(es[batch_index]));
+        }
+        batch_index += 1;
+        continue;
+      } else {
+      }
+      //  if the element the leaf is pointing me at is a sentinal, then update
+      //  leaf src and move on, there will never be sentinals in the batch
+      T temp_leaf_src = leaf_src;
+      if (std::get<0>(leaf_ptr[0]) >= top_bit) {
+        temp_leaf_src = std::get<0>(leaf_ptr[0]) ^ top_bit;
+      }
+
+      // otherwise, do a step of the merge
+      if (l_tuple(temp_leaf_src, std::get<0>(leaf_ptr[0])) ==
+          b_tuple(es[batch_index])) {
+        assert(std::get<0>(leaf_ptr[0]) < top_bit);
+        // if the key was already there first take the element that was already
+        // there, then merge in the new element from the batch
+        temp_ptr.set(leaf_ptr[0]);
+        value_update(*temp_ptr, b_value(es[batch_index]));
+        ++leaf_ptr;
+        ++batch_index;
+      } else if (l_tuple(temp_leaf_src, std::get<0>(leaf_ptr[0])) >
+                 b_tuple(es[batch_index])) {
+        temp_ptr.set(b_value(es[batch_index]));
+        mark_inserted(es_raw[batch_index]);
+        ++batch_index;
+        distinct_batch_elts++;
+      } else {
+        temp_ptr.set(leaf_ptr[0]);
+        ++leaf_ptr;
+        leaf_src = temp_leaf_src;
+      }
+      last_written = {leaf_src, temp_ptr.get()};
+      ++temp_ptr;
+    }
+
+    // write rest of the batch if it exists
+    while (batch_index < es.size() &&
+           b_tuple(es[batch_index]) < l_tuple(next_head_src, next_head_dest)) {
+      if (b_tuple(es[batch_index]) == last_written) {
+        if constexpr (!binary) {
+          value_update((temp_ptr - 1)[0], b_value(es[batch_index]));
+        }
+        ++batch_index;
+        continue;
+      }
+      temp_ptr.set(b_value(es[batch_index]));
+      mark_inserted(es_raw[batch_index]);
+      ++batch_index;
+      distinct_batch_elts++;
+
+      last_written = {leaf_src, temp_ptr.get()};
+      ++temp_ptr;
+    }
+
+    // write rest of the leaf it exists
+    while (leaf_ptr.get_pointer() < leaf_end && leaf_ptr.get() > 0) {
+      temp_ptr.set(leaf_ptr[0]);
+      ++leaf_ptr;
+      ++temp_ptr;
+    }
+
+    uint64_t used_elts = temp_ptr.get_pointer() - temp_arr_start.get_pointer();
+    // check if you can fit in the leaf
+    if (used_elts <= length_in_elements) {
+      head = *temp_arr_start;
+      element_move_function(head_key(), &std::get<0>(head), offsets_array);
+      for (uint64_t i = 0; i < (used_elts - 1); i++) {
+        (array + i).set(temp_arr_start[i + 1]);
+        element_move_function(std::get<0>(array[i]),
+                              (array + i).template get_pointer<0>(),
+                              offsets_array);
+      }
+      free(temp_arr);
+    } else {                 // special write for when you don't fit
+      head = element_type(); // special case head
+      assert(used_elts < (uint64_t)std::numeric_limits<T>::max());
+      set_out_of_place_used_elements((T)used_elts);
+      set_out_of_place_pointer(temp_arr);
+      set_out_of_place_soa_size(temp_size);
+    }
+    assert(batch_index <= es.size());
+
+#if DEBUG == 1
+    if (!check_increasing_or_zero<true>()) {
+      print();
+      assert(false);
+    }
+#endif
+    return {batch_index, distinct_batch_elts,
+            used_elts * sizeof(T) -
+                ((head_in_place) ? 0 : sizeof(T)) /* for the head*/};
+  }
+
   // Input: pointer to the start of this merge in the batch, end of batch,
   // value in the PMA at the next head (so we know when to stop merging)
   // Output: returns a tuple (ptr to where this merge stopped in the batch,
@@ -2851,7 +3158,8 @@ public:
     // want to add the last element
     // case 1: only one element from the batch goes into the leaf
     if (batch_start + 1 == batch_end || batch_start[1] >= end_val) {
-      auto [removed, byte_count] = remove<head_in_place>(*batch_start);
+      auto [removed, byte_count] =
+          remove<head_in_place, false>(*batch_start, nullptr);
       return {batch_start + 1, removed, byte_count};
     }
     // case 2: more than 1 elt from batch
@@ -2934,6 +3242,240 @@ public:
     return {batch_ptr, distinct_batch_elts, used_bytes};
   }
 
+  // this differs from above in that it knows how to deal with sentinals and
+  // different nodes regions
+  template <bool head_in_place, bool parallel, bool maintain_offsets,
+            std::ranges::random_access_range R, class element_func>
+  std::tuple<int64_t, uint64_t, uint64_t>
+  strip_from_leaf_pcsr(R &es_raw, element_func f, key_type this_head_src,
+                       key_type next_head_src, key_type next_head_dest,
+                       auto &offsets_array) {
+    // this leaf can't be empty or external
+    assert(head_key() != 0);
+    assert(array.get(length_in_elements - 1) == 0);
+
+    auto es = std::ranges::transform_view(
+        es_raw, [&](const auto &element) { return f(element); });
+
+#if DEBUG == 1
+    if (!check_increasing_or_zero<true>()) {
+      print();
+      assert(false);
+    }
+#endif
+    static constexpr T top_bit = (std::numeric_limits<T>::max() >> 1) + 1;
+    static_assert(maintain_offsets);
+    // make a tuple of src dest from the elements in the batch
+    auto b_tuple = [](const auto &element)
+        -> std::tuple<key_type, std::make_signed_t<key_type>> {
+      // we convert the dest to signed, this means that sentinals, who always
+      // have the first bit set will be less than all other elements in the same
+      // source
+      return {std::get<0>(element), std::get<1>(element)};
+    };
+
+    auto mark_removed = [](auto &element) {
+      assert(std::get<0>(element) < top_bit);
+      std::get<0>(element) |= top_bit;
+    };
+
+    // make a tuple for the elements in the leaf
+    auto l_tuple = [](key_type src, key_type dest)
+        -> std::tuple<key_type, std::make_signed_t<key_type>> {
+      return {src, dest};
+    };
+    assert(es.size() != 0);
+    if (es.size() == 1 ||
+        b_tuple(es[1]) >= l_tuple(next_head_src, next_head_dest)) {
+      // if the batch size is 1 we never need to use extra space
+      // if we are inserting into the first and the head isn't a sentinal we can
+      // just call the standard function, since it will properly shift things to
+      // the right
+      const auto &elem = es[0];
+      if (this_head_src == std::get<0>(elem) &&
+          (head_key() < top_bit ||
+           head_key() >= (top_bit | (this_head_src + 1)))) {
+        auto [removed, byte_count] = remove<head_in_place, maintain_offsets>(
+            std::get<1>(elem), offsets_array);
+        if (removed) {
+          mark_removed(es_raw[0]);
+        }
+        return {1, removed, byte_count};
+      }
+      // else we need to find the start of our fake leaf
+      T my_sentinal = top_bit | std::get<0>(elem);
+      // this means the head is our sentinal
+      if (head_key() == my_sentinal) {
+        uncompressed_leaf l(*array, array + 1,
+                            (length_in_elements - 1) * sizeof(T));
+        auto [removed, byte_count] = l.template remove<true, maintain_offsets>(
+            std::get<1>(elem), offsets_array);
+        // added since this function won't count the space used in the real
+        // leaf, just the fake one
+        if constexpr (head_in_place) {
+          byte_count += sizeof(T);
+        }
+        // std::cout << "insert 2\n";
+        if (removed) {
+          mark_removed(es_raw[0]);
+        }
+        return {1, removed, byte_count};
+      }
+      // we loop through to find the correct sentinal
+      size_t offset = std::numeric_limits<size_t>::max();
+      for (uint64_t i = 0; i < length_in_elements; i++) {
+        if (array.get(i) == my_sentinal) {
+          offset = i;
+        }
+      }
+      if (offset == std::numeric_limits<size_t>::max()) {
+        return {1, false, 0};
+      }
+      // offset would be the sentinal
+      //  offset+1 is the fake head
+      //  offset+2 is the fake data
+      uncompressed_leaf l(*(array + 1 + offset), array + 2 + offset,
+                          (length_in_elements - (2 + offset)) * sizeof(T));
+      auto [removed, byte_count] = l.template remove<true, maintain_offsets>(
+          std::get<1>(elem), offsets_array);
+      // added since this function won't count the space used in the real
+      // leaf, just the fake one
+      byte_count += sizeof(T) * (offset + 1);
+      if constexpr (head_in_place) {
+        byte_count += sizeof(T);
+      }
+      // std::cout << "insert 3\n";
+      if (removed) {
+        mark_removed(es_raw[0]);
+      }
+      return {1, removed, byte_count};
+    }
+
+    element_ptr_type front_pointer = array;
+    element_ptr_type back_pointer = array;
+
+    uint64_t distinct_batch_elts = 0;
+    uint64_t batch_index = 0;
+    T *leaf_end = array.get_pointer() + length_in_elements;
+
+    // TODO(wheatman) do the parallel strip, though this case is only needed
+    // when you insert a constant fraction of the total elements to a single
+    // leaf
+    T leaf_src = this_head_src;
+
+    while (batch_index < es.size() &&
+           b_tuple(es[batch_index]) < l_tuple(leaf_src, head_key())) {
+      batch_index += 1;
+    }
+
+    // deal with the head
+    bool head_done = false;
+    if ((batch_index < es.size() &&
+         l_tuple(leaf_src, std::get<0>(head)) != b_tuple(es[batch_index])) ||
+        batch_index == es.size()) {
+      head_done = true;
+    } else {
+      mark_removed(es_raw[batch_index]);
+      batch_index++;
+      distinct_batch_elts++;
+    }
+
+    // the standard merge
+    while (batch_index < es.size() &&
+           b_tuple(es[batch_index]) < l_tuple(next_head_src, next_head_dest) &&
+           front_pointer.get_pointer() < leaf_end && front_pointer.get() > 0) {
+      //  if the element the leaf is pointing me at is a sentinal, then update
+      //  leaf src and move on, there will never be sentinals in the batch
+      T temp_leaf_src = leaf_src;
+      if (std::get<0>(front_pointer[0]) >= top_bit) {
+        temp_leaf_src = std::get<0>(front_pointer[0]) ^ top_bit;
+      }
+
+      // otherwise, do a step of the merge
+      if (l_tuple(temp_leaf_src, std::get<0>(front_pointer[0])) ==
+          b_tuple(es[batch_index])) {
+        assert(std::get<0>(front_pointer[0]) < top_bit);
+        mark_removed(es_raw[batch_index]);
+        ++front_pointer;
+        ++batch_index;
+        distinct_batch_elts++;
+      } else if (l_tuple(temp_leaf_src, std::get<0>(front_pointer[0])) >
+                 b_tuple(es[batch_index])) {
+        ++batch_index;
+      } else {
+        if (!head_done) {
+          head = *front_pointer;
+          element_move_function(head_key(), &std::get<0>(head), offsets_array);
+          head_done = true;
+        } else {
+          *back_pointer = *front_pointer;
+          element_move_function(back_pointer.get(),
+                                (back_pointer).template get_pointer<0>(),
+                                offsets_array);
+          ++back_pointer;
+        }
+        ++front_pointer;
+        leaf_src = temp_leaf_src;
+      }
+    }
+
+    // write rest of the leaf it exists
+    while (front_pointer.get_pointer() < leaf_end && front_pointer.get() > 0) {
+      if (!head_done) {
+        head = *front_pointer;
+        element_move_function(head_key(), &std::get<0>(head), offsets_array);
+        head_done = true;
+      } else {
+        *back_pointer = *front_pointer;
+        element_move_function(back_pointer.get(),
+                              (back_pointer).template get_pointer<0>(),
+                              offsets_array);
+        ++back_pointer;
+      }
+      ++front_pointer;
+    }
+
+    uint64_t used_elts = back_pointer.get_pointer() - array.get_pointer();
+    if (!head_done) {
+      head = element_type();
+      set_out_of_place_used_elements(0);
+    }
+
+    // clear the rest of the space
+    while (back_pointer.get_pointer() < front_pointer.get_pointer()) {
+      if constexpr (!binary) {
+        // the key needs to be a simple type that this is not needed for
+        back_pointer.zero();
+      }
+      *back_pointer = element_type();
+      ++back_pointer;
+    }
+    uint64_t used_bytes = used_elts * sizeof(T);
+    if (head_key() != 0) {
+      if constexpr (head_in_place) {
+        used_bytes += sizeof(T);
+      }
+    }
+
+    // eat up as much of the batch as we can, so we don't try and remove
+    // something else from this leaf
+
+    while (batch_index < es.size() &&
+           b_tuple(es[batch_index]) < l_tuple(next_head_src, next_head_dest)) {
+      batch_index++;
+    }
+
+    assert(batch_index <= es.size());
+
+#if DEBUG == 1
+    if (!check_increasing_or_zero<true>()) {
+      print();
+      assert(false);
+    }
+#endif
+    return {batch_index, distinct_batch_elts, used_bytes};
+  }
+
   class merged_data {
   public:
     uncompressed_leaf leaf;
@@ -2989,7 +3531,7 @@ public:
           if constexpr (!binary) {
             (merged_mp + start + j).zero();
           }
-          merged_mp[start + j] = ptr_to_temp[j];
+          (merged_mp + start + j).set(ptr_to_temp[j]);
         }
         start += get_out_of_place_used_elements(leaf_data_start.get_pointer());
       } else { // otherwise, reading regular leaf
@@ -3178,6 +3720,7 @@ public:
                            uint64_t leaf_size_in_bytes,
                            uint64_t leaf_start_index, F index_to_head,
                            density_array_type density_array) {
+#if PARALLEL == 1
     if constexpr (parallel) {
       if (num_leaves > ParallelTools::getWorkers() * 100U) {
         return parallel_merge<head_in_place, have_densities>(
@@ -3185,6 +3728,7 @@ public:
             index_to_head, density_array);
       }
     }
+#endif
 
     uint64_t leaf_size = leaf_size_in_bytes / sizeof(T);
 
@@ -3226,7 +3770,7 @@ public:
           if constexpr (!binary) {
             (merged_mp + start + j).zero();
           }
-          merged_mp[start + j] = ptr_to_temp[j];
+          (merged_mp + start + j).set_and_zero(ptr_to_temp[j]);
         }
 
         ptr_to_temp.free_first(); // release temp storage
@@ -3244,7 +3788,7 @@ public:
             if constexpr (!binary) {
               (merged_mp + local_start + j).zero();
             }
-            merged_mp[local_start + j] = array[j + src_idx + 1];
+            (merged_mp + local_start + j).set_and_zero(array[j + src_idx + 1]);
           }
         } else {
           for (uint64_t j = 0; j < leaf_size; j++) {
@@ -3276,7 +3820,7 @@ public:
                              memory_size * sizeof(T) - sizeof(T));
     ASSERT(start == result.element_count(), "got %lu, expected %lu\n", start,
            result.element_count());
-    assert(result.check_increasing_or_zero());
+    // assert(result.check_increasing_or_zero());
     return {result, start};
   }
 
@@ -3289,14 +3833,15 @@ public:
   // output: split input leaf into num_leaves leaves, each with
   // num_output_bytes bytes
   template <bool head_in_place, bool store_densities, bool support_rank,
-            bool parallel, typename F, typename density_array_type,
-            typename rank_tree_array_type>
+            bool parallel, bool maintain_offsets, typename F,
+            typename density_array_type, typename rank_tree_array_type,
+            typename offsets_array_type>
   void split(uint64_t num_leaves, const uint64_t num_elements,
              uint64_t bytes_per_leaf, element_ptr_type dest_region,
              uint64_t leaf_start_index, F index_to_head,
              density_array_type density_array,
-             rank_tree_array_type rank_tree_array,
-             uint64_t total_leaves) const {
+             rank_tree_array_type rank_tree_array, uint64_t total_leaves,
+             offsets_array_type offsets_array) const {
 
     split_cnt.add(num_leaves);
     uint64_t elements_per_leaf = bytes_per_leaf / sizeof(T);
@@ -3314,6 +3859,11 @@ public:
           uint64_t i = 0;
           const uint64_t j3 = 0;
           index_to_head(leaf_start_index) = head;
+          if constexpr (maintain_offsets) {
+            element_move_function(std::get<0>(index_to_head(leaf_start_index)),
+                                  &std::get<0>(index_to_head(leaf_start_index)),
+                                  offsets_array);
+          }
           uint64_t out = 0;
           // -1 for head
           uint64_t count_for_leaf = count_per_leaf + (i < extra) - 1;
@@ -3330,7 +3880,12 @@ public:
             if constexpr (!binary) {
               (dest_region + out + k).zero();
             }
-            dest_region[out + k] = array[j3 + k];
+            (dest_region + out + k).set(array[j3 + k]);
+            if constexpr (maintain_offsets) {
+              element_move_function(std::get<0>(dest_region[out + k]),
+                                    (dest_region + out + k).get_pointer(),
+                                    offsets_array);
+            }
           }
           if constexpr (store_densities) {
             density_array[leaf_start_index + i] = count_for_leaf * sizeof(T);
@@ -3372,7 +3927,14 @@ public:
         // seperate loops due to more weird compiler behavior
         ParallelTools::parallel_for(1, num_leaves, [&](uint64_t i) {
           uint64_t j3 = count_per_leaf * i + std::min(i, extra);
-          index_to_head(leaf_start_index + i) = array[j3 - 1];
+          element_ptr_type(index_to_head(leaf_start_index + i))
+              .set(array[j3 - 1]);
+          if constexpr (maintain_offsets) {
+            element_move_function(
+                std::get<0>(index_to_head(leaf_start_index + i)),
+                &std::get<0>(index_to_head(leaf_start_index + i)),
+                offsets_array);
+          }
         });
         ParallelTools::parallel_for(1, num_leaves, [&](uint64_t i) {
           const uint64_t j3 = count_per_leaf * i + std::min(i, extra);
@@ -3392,7 +3954,12 @@ public:
             if constexpr (!binary) {
               (dest_region + out + k).zero();
             }
-            dest_region[out + k] = array[j3 + k];
+            (dest_region + out + k).set(array[j3 + k]);
+            if constexpr (maintain_offsets) {
+              element_move_function(std::get<0>(dest_region[out + k]),
+                                    (dest_region + out + k).get_pointer(),
+                                    offsets_array);
+            }
           }
           if constexpr (store_densities) {
             density_array[leaf_start_index + i] = count_for_leaf * sizeof(T);
@@ -3478,9 +4045,19 @@ public:
       uint64_t j3 = count_per_leaf * i + std::min(i, extra) - 1;
       if (i == 0) {
         element_ptr_type(index_to_head(leaf_start_index)).set(head);
+        if constexpr (maintain_offsets) {
+          element_move_function(std::get<0>(index_to_head(leaf_start_index)),
+                                &std::get<0>(index_to_head(leaf_start_index)),
+                                offsets_array);
+        }
         j3 = 0;
       } else {
         element_ptr_type(index_to_head(leaf_start_index + i)).set(array[j3]);
+        if constexpr (maintain_offsets) {
+          element_move_function(
+              std::get<0>(index_to_head(leaf_start_index + i)),
+              &std::get<0>(index_to_head(leaf_start_index + i)), offsets_array);
+        }
         j3 += 1;
       }
       uint64_t out = i * elements_per_leaf;
@@ -3497,6 +4074,11 @@ public:
       }
       for (uint64_t k = 0; k < count_for_leaf; k++) {
         (dest_region + out + k).set(array[j3 + k]);
+        if constexpr (maintain_offsets) {
+          element_move_function(std::get<0>(dest_region[out + k]),
+                                (dest_region + out + k).get_pointer(),
+                                offsets_array);
+        }
       }
       if constexpr (store_densities) {
         density_array[leaf_start_index + i] = count_for_leaf * sizeof(T);
@@ -3579,16 +4161,16 @@ public:
   // inserts an element
   // first return value indicates if something was inserted
   // if something was inserted the second value tells you the current size
-  template <bool head_in_place, typename ValueUpdate = std::nullptr_t>
-  std::pair<bool, size_t> insert(element_type x,
-                                 ValueUpdate value_update = {}) {
+  template <bool head_in_place, typename ValueUpdate, bool maintain_offsets>
+  std::pair<bool, size_t> insert(element_type x, ValueUpdate value_update,
+                                 auto offsets_array) {
     static_assert(
         binary ||
             std::is_invocable_v<ValueUpdate, element_ref_type, element_type &>,
         "the value update function must take in a reference to the current "
         "value and the new value by reference");
 #if DEBUG == 1
-    if (!check_increasing_or_zero()) {
+    if (!check_increasing_or_zero<maintain_offsets>()) {
       print();
       assert(false);
     }
@@ -3601,14 +4183,19 @@ public:
       }
       return {false, 0};
     }
+    bool new_head = false;
     if (std::get<0>(x) < head_key()) {
       tuple_bit_swap(head, x);
+      new_head = true;
     }
     if (head_key() == 0) {
-      head = x;
+      head = std::move(x);
       return {true, (head_in_place) ? sizeof(T) : 0};
     }
-    uint64_t fr = find(std::get<0>(x));
+    uint64_t fr = 0;
+    if (!new_head) {
+      fr = find(std::get<0>(x));
+    }
     if (array.get(fr) == std::get<0>(x)) {
       if constexpr (!binary) {
         value_update(array[fr], x);
@@ -3623,14 +4210,22 @@ public:
     // for (uint64_t i = fr; i < length_in_elements - 1; i++)
     for (uint64_t i = length_in_elements - 1; i > fr; i--) {
       (array + i).set_and_zero(array[i - 1]);
+      if constexpr (maintain_offsets) {
+        element_move_function(std::get<0>(array[i]), &std::get<0>(array[i]),
+                              offsets_array);
+      }
       num_elements += (std::get<0>(array[i]) != 0);
     }
     if constexpr (!binary) {
       (array + fr).zero();
     }
-    array[fr] = x;
+    array[fr] = std::move(x);
+    if constexpr (maintain_offsets) {
+      element_move_function(std::get<0>(array[fr]), &std::get<0>(array[fr]),
+                            offsets_array);
+    }
 #if DEBUG == 1
-    if (!check_increasing_or_zero()) {
+    if (!check_increasing_or_zero<maintain_offsets>()) {
       print();
       assert(false);
     }
@@ -3704,12 +4299,17 @@ public:
   // removes an element
   // first return value indicates if something was removed
   // if something was removed the second value tells you the current size
-  template <bool head_in_place> std::pair<bool, size_t> remove(T x) {
+  template <bool head_in_place, bool maintain_offsets>
+  std::pair<bool, size_t> remove(T x, auto offsets_array) {
     if (head_key() == 0 || x < head_key()) {
       return {false, 0};
     }
     if (x == head_key()) {
       head = array[0];
+      if constexpr (maintain_offsets) {
+        element_move_function(std::get<0>(head), &std::get<0>(head),
+                              offsets_array);
+      }
       x = array.get();
       if (x == 0) {
         return {true, 0};
@@ -3721,6 +4321,10 @@ public:
     }
     for (uint64_t i = fr; i < length_in_elements - 1; i++) {
       array[i] = array[i + 1];
+      if constexpr (maintain_offsets) {
+        element_move_function(std::get<0>(array[i]), &std::get<0>(array[i]),
+                              offsets_array);
+      }
     }
     if constexpr (!binary) {
       // the key needs to be a simple type that this is not needed for
@@ -3788,17 +4392,20 @@ public:
   }
 
   template <bool no_early_exit, class F> bool map(F f) const {
-    auto unwrap = [](auto elem) {
+    auto process = [](const auto &elem, F f) {
       if constexpr (binary) {
-        return std::get<0>(elem);
+        return f(std::get<0>(elem));
       } else {
-        return elem;
+        return f(elem);
       }
     };
+    if (std::get<0>(head) == 0) {
+      return false;
+    }
     if constexpr (no_early_exit) {
-      f(unwrap(head));
+      process(head, f);
     } else {
-      if (f(unwrap(head))) {
+      if (process(head, f)) {
         return true;
       }
     }
@@ -3807,9 +4414,9 @@ public:
         return false;
       }
       if constexpr (no_early_exit) {
-        f(unwrap(array[i]));
+        process(array[i], f);
       } else {
-        if (f(unwrap(array[i]))) {
+        if (process(array[i], f)) {
           return true;
         }
       }
@@ -3965,7 +4572,9 @@ public:
     return iterator(zero_element_ptr(), array);
   }
 
+  template <bool pcsr = false>
   [[nodiscard]] bool check_increasing_or_zero(bool external = false) const {
+    static constexpr T top_bit = (std::numeric_limits<T>::max() >> 1) + 1;
     // if using temp elsewhere
     if (head_key() == 0) {
       if (get_out_of_place_used_elements() > 0) {
@@ -3975,26 +4584,46 @@ public:
         }
         uint64_t size_in_bytes = get_out_of_place_used_elements() * sizeof(T);
         void *ptr = get_out_of_place_pointer();
+        assert(ptr != nullptr);
         element_ptr_type mptr =
             SOA_type::get_static_ptr(ptr, get_out_of_place_soa_size(), 0);
         auto leaf =
             uncompressed_leaf(*mptr, mptr + 1, size_in_bytes - sizeof(T));
-        return leaf.check_increasing_or_zero(true);
+        return leaf.template check_increasing_or_zero<pcsr>(true);
       }
       return true;
     }
 
-    element_type check = head;
+    key_type check = std::get<0>(head);
+    key_type last_sentinal = 0;
+    if constexpr (pcsr) {
+      if (std::get<0>(head) >= top_bit) {
+        last_sentinal = std::get<0>(head);
+        check = 0;
+      }
+    }
     for (uint64_t i = 0; i < length_in_elements; i++) {
+      if constexpr (pcsr) {
+        if (array.get(i) >= top_bit) {
+          if (array.get(i) <= last_sentinal) {
+            std::cout << "bad sentinal in position " << i << std::endl;
+            std::cout << array[i] << " <= " << last_sentinal << std::endl;
+            return false;
+          }
+          last_sentinal = array.get(i);
+          check = 0;
+          continue;
+        }
+      }
       if (array.get(i) == 0) {
         continue;
       }
-      if (std::get<0>(array[i]) <= std::get<0>(check)) {
+      if (std::get<0>(array[i]) <= check) {
         std::cout << "bad in position " << i << std::endl;
         std::cout << array[i] << " <= " << check << std::endl;
         return false;
       }
-      check = array[i];
+      check = std::get<0>(array[i]);
     }
     // otherwise not
     return true;

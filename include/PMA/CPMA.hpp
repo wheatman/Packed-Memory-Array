@@ -8,9 +8,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <ranges>
+#include <tuple>
+#include <utility>
 #ifdef __AVX2__
 #include <immintrin.h>
 #endif
+#include <concepts>
 #include <iostream>
 #include <iterator>
 #include <limits>
@@ -63,6 +67,7 @@
 #include "StructOfArrays/multipointer.hpp"
 #include "StructOfArrays/soa.hpp"
 
+#include "parlay/internal/group_by.h"
 #include "parlay/primitives.h"
 #pragma clang diagnostic pop
 
@@ -79,15 +84,19 @@ template <typename T, typename U> struct overwrite_on_insert {
   }
 };
 
+class make_pcsr {};
+
 template <typename l, HeadForm h, uint64_t b = 0, bool density = false,
           bool rank = false, bool fixed_size_ = false,
           uint64_t max_fixed_size_ = 4096, bool parallel_ = true,
+          bool maintain_offsets_ = false,
           typename value_update_ = overwrite_on_insert<
               typename l::element_ref_type, typename l::element_type>>
 class PMA_traits {
 public:
   using leaf = l;
   using key_type = typename leaf::key_type;
+  static constexpr bool compressed = leaf::compressed;
   static constexpr HeadForm head_form = h;
   static constexpr uint64_t B_size = b;
   static constexpr bool store_density = density;
@@ -123,6 +132,7 @@ public:
 
   static constexpr int leaf_blow_up_factor = (sizeof(key_type) == 3) ? 18 : 16;
   static constexpr uint64_t min_leaf_size = 64;
+  static constexpr bool maintain_offsets = maintain_offsets_;
 };
 template <typename T = uint64_t>
 using pma_settings = PMA_traits<uncompressed_leaf<T>, InPlace, 0, false, false>;
@@ -526,6 +536,31 @@ public:
   using value_type = typename traits::value_type;
   using value_update = typename traits::value_update;
 
+  // types needs for graphs
+  //  When we store a graph we assume that we are storing 64 bit element paris
+  //  of src dest
+  using node_t = uint32_t;
+  using extra_data_t =
+      std::pair<std::unique_ptr<typename leaf::iterator, free_delete>,
+                std::unique_ptr<uint64_t, free_delete>>;
+
+  // bool in binary/
+  // the value if there is only 1 value
+  // tuple of the values if there are multiple
+  static constexpr auto get_value_type() {
+    if constexpr (binary) {
+      return (bool)true;
+    } else {
+      value_type v;
+      if constexpr (std::tuple_size_v<value_type> == 1) {
+        return std::tuple_element_t<0, value_type>();
+      } else {
+        return v;
+      }
+    }
+  }
+  using weight_t = decltype(get_value_type());
+
 private:
   static constexpr double growing_factor = traits::growing_factor;
 
@@ -589,6 +624,17 @@ private:
 
   bool has_0 = false;
 
+  // when we are running in pcsr like mode, this is to store the offsets to the
+  // different node regions
+  // we store the following
+  // - a pointer an an array of pointers to the start of each region
+  // - - there is an extra one at the end to point at the overall end
+  // - the number of nodes (how long the arrays are)
+  // - the degree of each node
+  [[no_unique_address]]
+  typename std::conditional<traits::maintain_offsets, pcsr_node_info<key_type>,
+                            empty_type>::type offsets_array;
+
   static constexpr std::array<std::array<float, sizeof(key_type) * 8>, 256>
   get_upper_density_bound_table() {
     uint64_t max_fixed_size_index = get_max_fixed_size();
@@ -629,6 +675,9 @@ private:
           val = std::max(((float)sizeof(key_type)) / m.logn,
                          1.0F / 4.0F - ((.125F * j) / m.H));
         }
+        if (val <= 0) {
+          val = std::numeric_limits<float>::min();
+        }
         res[i][j] = val;
       }
     }
@@ -652,6 +701,16 @@ private:
   key_type *head_array() const {
     static_assert(head_form != InPlace);
     return reinterpret_cast<key_type *>(underlying_array_char());
+  }
+
+  key_type *key_array() const {
+    auto ptr = reinterpret_cast<key_type *>(
+        underlying_array_char() + meta_data[meta_data_index].data_array_offset);
+    if constexpr (!binary) {
+      // +1 to offset past the value for zero
+      ptr += 1;
+    }
+    return ptr;
   }
 
   key_type *data_array() const {
@@ -709,6 +768,11 @@ private:
                                                   i);
     }
   }
+  template <size_t... Is> auto get_zero_el_ref() const {
+    static_assert(!binary);
+    return get_data_ref<Is...>(-1);
+  }
+
   template <size_t... Is> auto get_data_ptr(size_t i) const {
     if constexpr (!binary) {
       // +1 to offset past the value for zero
@@ -716,6 +780,11 @@ private:
     }
     return SOA_type::template get_static_ptr<Is...>(data_array(),
                                                     soa_num_spots(), i);
+  }
+
+  template <size_t... Is> auto get_zero_el_ptr() const {
+    static_assert(!binary);
+    return get_data_ptr<Is...>(-1);
   }
 
   template <size_t... Is> auto get_head_ref(size_t i) const {
@@ -1010,7 +1079,8 @@ public:
   noexcept
       : meta_data_index(other.meta_data_index), has_0(other.has_0),
         count_elements_(other.count_elements_),
-        underlying_array(other.underlying_array) {
+        underlying_array(other.underlying_array),
+        offsets_array(other.offsets_array) {
     other.count_elements_ = 0;
     other.meta_data_index = 0;
     other.has_0 = false;
@@ -1020,6 +1090,9 @@ public:
 #if VQSORT == 1
     sorter = other.sorter;
 #endif
+    if constexpr (traits::maintain_offsets) {
+      other.offsets_array = pcsr_node_info<key_type>();
+    }
   }
   // Copy constructor
   CPMA(const CPMA &other)
@@ -1041,6 +1114,19 @@ public:
 #if VQSORT == 1
     sorter = other.sorter;
 #endif
+    if constexpr (traits::maintain_offsets) {
+      offsets_array.size = other.offsets_array.size;
+      offsets_array.locations =
+          malloc(offsets_array.size * sizeof(*(offsets_array.locations)));
+      offsets_array.degrees =
+          malloc(offsets_array.size * sizeof(*(offsets_array.degrees)));
+      ParallelTools::parallel_for(0, offsets_array.size, [&](size_t i) {
+        offsets_array.locations[i] =
+            underlying_array_char() +
+            (other.offsets_array.locations[i] - other.underlying_array_char());
+        offsets_array.degrees[i] = other.offsets_array.degrees[i];
+      });
+    }
   }
   //   // Move assignment
   CPMA &operator=(CPMA &&other) noexcept {
@@ -1060,6 +1146,9 @@ public:
 #if VQSORT == 1
     sorter = other.sorter;
 #endif
+    if constexpr (traits::maintain_offsets) {
+      other.offsets_array = pcsr_node_info<key_type>();
+    }
     return *this;
   }
   // copy assignment
@@ -1086,6 +1175,19 @@ public:
 #if VQSORT == 1
     sorter = other.sorter;
 #endif
+    if constexpr (traits::maintain_offsets) {
+      offsets_array.size = other.offsets_array.size;
+      offsets_array.locations =
+          malloc(offsets_array.size * sizeof(*(offsets_array.locations)));
+      offsets_array.degrees =
+          malloc(offsets_array.size * sizeof(*(offsets_array.degrees)));
+      ParallelTools::parallel_for(0, offsets_array.size, [&](size_t i) {
+        offsets_array.locations[i] =
+            underlying_array_char() +
+            (other.offsets_array.locations[i] - other.underlying_array_char());
+        offsets_array.degrees[i] = other.offsets_array.degrees[i];
+      });
+    }
     return *this;
   }
   CPMA(key_type *start, key_type *end);
@@ -1102,7 +1204,7 @@ public:
             });
           }
           if (has_0) {
-            get_data_ptr(-1).deconstruct();
+            get_zero_el_ptr().deconstruct();
           }
           ParallelTools::parallel_for(0, soa_num_spots() - 1, [&](size_t i) {
             if (get_data_ref<0>(i) != 0) {
@@ -1112,6 +1214,10 @@ public:
         }
       }
       free(underlying_array);
+    }
+    if constexpr (traits::maintain_offsets) {
+      free(offsets_array.locations);
+      free(offsets_array.degrees);
     }
   }
   void print_pma() const;
@@ -1159,10 +1265,14 @@ public:
   bool remove_by_rank(key_type e, uint64_t rank);
   // return the amount of memory the structure uses
 
-  [[nodiscard]] uint64_t get_size() {
+  [[nodiscard]] uint64_t get_size() const {
     uint64_t total_size = sizeof(CPMA);
     if constexpr (!fixed_size) {
       total_size += meta_data[meta_data_index].underlying_array_size;
+    }
+    if constexpr (traits::maintain_offsets) {
+      total_size += offsets_array.size * sizeof(*(offsets_array.locations));
+      total_size += offsets_array.size * sizeof(*(offsets_array.degrees));
     }
     return total_size;
   }
@@ -1177,7 +1287,7 @@ public:
   [[nodiscard]] uint64_t size() const { return get_element_count() + has_0; }
   [[nodiscard]] uint64_t num_edges() const { return size(); }
 
-  uint64_t get_degree(uint64_t i, const auto &extra_data) const {
+  uint64_t get_degree(uint64_t i, const extra_data_t &extra_data) const {
     return extra_data.second.get()[i];
   }
   [[nodiscard]] uint64_t get_head_structure_size() const {
@@ -1207,17 +1317,20 @@ public:
   // recent element so we know what the difference is from if we are
   // starting from a head, returns nullptr and the number leaf we are
   // starting with
-  std::pair<std::unique_ptr<typename leaf::iterator, free_delete>,
-            std::unique_ptr<uint64_t, free_delete>>
-  getExtraData(bool skip = false) const {
+  template <class T> extra_data_t getExtraData(T arg) const {
     // TODO(wheatman) handle if there is a self loop at zero
+    bool skip = false;
+    if constexpr (std::is_constructible_v<T, bool>) {
+      skip = arg;
+    }
     if (skip) {
       return {};
     }
 
     auto hints = (typename leaf::iterator *)malloc(
         sizeof(typename leaf::iterator) * (num_nodes() + 1));
-    ParallelTools::For<parallel>(0, num_nodes(), 1024, [&](uint64_t i_) {
+    hints[0] = get_leaf(0).begin();
+    ParallelTools::For<parallel>(1, num_nodes(), 1024, [&](uint64_t i_) {
       uint64_t end = std::min(i_ + 1024, (uint64_t)num_nodes());
       uint64_t i = i_;
       uint64_t start_hint = find_containing_leaf_index(i << 32U);
@@ -1271,10 +1384,7 @@ public:
   }
 
   template <class F>
-  void map_neighbors(uint64_t i, F f,
-                     [[maybe_unused]] const std::pair<
-                         std::unique_ptr<typename leaf::iterator, free_delete>,
-                         std::unique_ptr<uint64_t, free_delete>> &extra_data,
+  void map_neighbors(uint64_t i, F f, const extra_data_t &extra_data,
                      bool run_parallel) const {
     // TODO(wheatman) handle if there is a self loop at zero
     auto hints = extra_data.first.get();
@@ -1303,11 +1413,8 @@ public:
 
   // used for the graph world
   template <class F>
-  void
-  map_range(F f, uint64_t start_node, uint64_t end_node,
-            [[maybe_unused]] const std::pair<
-                std::unique_ptr<typename leaf::iterator, free_delete>,
-                std::unique_ptr<uint64_t, free_delete>> &extra_data) const {
+  void map_range(F f, uint64_t start_node, uint64_t end_node,
+                 [[maybe_unused]] const extra_data_t &extra_data) const {
     uint64_t start = start_node << 32UL;
     uint64_t end = end_node << 32UL;
     auto f2 = [&](uint64_t el) { return f(el >> 32UL, el & 0xFFFFFFFFUL); };
@@ -1365,13 +1472,13 @@ public:
         // this being zero means it knows to go to the next leaf, which is the
         // first real leaf, and since this is only for the zero element, the
         // key is always zero
-        assert(get_data_ref<0>(-1) == 0);
+        assert(get_zero_el_ref<0>() == 0);
         uint64_t next_leaf = 0;
         if (get_element_count() == 0) {
           next_leaf = 1;
         }
         return iterator(
-            typename leaf::iterator(get_data_ref(-1), get_data_ptr(-1)),
+            typename leaf::iterator(get_zero_el_ref(), get_zero_el_ptr()),
             next_leaf, *this);
       }
     } else {
@@ -1419,8 +1526,107 @@ public:
   uint64_t
   get_leaf_number_from_leaf_iterator(const typename leaf::iterator &it) const {
     uint8_t *ptr = (uint8_t *)it.get_pointer();
-    uintptr_t bytes_from_start = ptr - ((uint8_t *)data_array());
+    uintptr_t bytes_from_start = ptr - ((uint8_t *)key_array());
     return bytes_from_start / logN();
+  }
+  // extra function to help with PCSR
+  CPMA(make_pcsr tag, size_t num_nodes);
+
+  bool insert_pcsr(key_type src, key_type dest, value_type val);
+  bool insert_pcsr(key_type src, key_type dest) {
+    static_assert(binary);
+    return insert_pcsr(src, dest, {});
+  }
+  bool remove_pcsr(key_type src, key_type dest);
+  bool contains_pcsr(key_type src, key_type dest) const;
+
+  template <std::ranges::random_access_range R, class Vector_pairs>
+  uint64_t insert_batch_internal_pcsr(
+      R &es, std::invocable<typename std::ranges::range_value_t<R>> auto &&f,
+      Vector_pairs &leaves_to_check, uint64_t start_leaf_idx,
+      uint64_t end_leaf_idx);
+
+  template <std::ranges::random_access_range R, class Vector_pairs>
+  uint64_t remove_batch_internal_pcsr(
+      R &es, std::invocable<typename std::ranges::range_value_t<R>> auto &&f,
+      Vector_pairs &leaves_to_check, uint64_t start_leaf_idx,
+      uint64_t end_leaf_idx);
+
+  template <std::ranges::random_access_range R>
+  uint64_t insert_batch_pcsr(
+      R &es, std::invocable<typename std::ranges::range_value_t<R>> auto &&f,
+      bool sorted = false);
+  template <std::ranges::random_access_range R>
+  uint64_t remove_batch_pcsr(
+      R &es, std::invocable<typename std::ranges::range_value_t<R>> auto &&f,
+      bool sorted = false);
+
+  std::pair<uint64_t, bool> get_info_from_raw_pointer(void *ptr) const;
+
+  template <bool no_early_exit, bool parallel, class F>
+  void map_neighbors_pcsr(key_type node, F f) const;
+
+  key_type degree_pcsr(key_type node) const {
+    assert(offsets_array.size > 0);
+    assert(offsets_array.degrees != nullptr);
+    return offsets_array.degrees[node];
+  }
+
+  key_type num_nodes_pcsr() const {
+    assert(offsets_array.size > 0);
+    return offsets_array.size - 1;
+  }
+
+  static constexpr typename traits::key_type pcsr_top_bit =
+      (std::numeric_limits<typename traits::key_type>::max() >> 1) + 1;
+  static_assert(std::has_single_bit(static_cast<size_t>(pcsr_top_bit)));
+
+  [[nodiscard]] bool verify_pcsr_nodes() const {
+
+    for (key_type i = 0; i < num_nodes_pcsr(); i++) {
+      void *location = offsets_array.locations[i];
+      if (location == nullptr) {
+        std::cout << "sentinal is nullptr\n";
+        return false;
+      }
+      key_type element = *((key_type *)location);
+      if (element < pcsr_top_bit) {
+        std::cout << "offset location not pointing at a sentinal\n";
+        std::cout << i << ", " << element << "\n";
+        return false;
+      }
+      if ((element ^ pcsr_top_bit) != i) {
+        std::cout << "offset location pointing to the wrong sentinal\n";
+        return false;
+      }
+    }
+
+    assert(offsets_array.locations[num_nodes_pcsr()] ==
+           data_array() + soa_num_spots());
+    return true;
+  }
+
+  [[nodiscard]] bool verify_pcsr_degrees() const {
+    bool good = true;
+    for (key_type i = 0; i < num_nodes_pcsr(); i++) {
+      key_type stored_degree = degree_pcsr(i);
+      key_type counted_degree = 0;
+      map_neighbors_pcsr<true, false>(
+          i, [&]([[maybe_unused]] const auto &arg1,
+                 [[maybe_unused]] const auto &arg2) { counted_degree += 1; });
+      if (stored_degree != counted_degree) {
+        std::cout << "stored degree count is off for node " << i << "\n";
+        std::cout << "stored count is " << stored_degree
+                  << " counted degree is " << counted_degree << "\n";
+        good = false;
+      }
+    }
+    return good;
+  }
+
+  [[nodiscard]] size_t num_edges_pcsr() const {
+    assert(offsets_array.size > 0);
+    return get_element_count() - num_nodes_pcsr();
   }
 };
 
@@ -1477,7 +1683,8 @@ template <typename traits> void CPMA<traits>::grow_list(uint64_t times) {
           density_array());
   element_type zero_element;
   if constexpr (!binary) {
-    zero_element = get_data_ref(-1);
+    tuple_set_and_zero(zero_element, get_zero_el_ref());
+    // zero_element = get_zero_el_ref();
   }
   assert(((uint64_t)meta_data_index) + times <= 255);
   meta_data_index += times;
@@ -1502,7 +1709,7 @@ template <typename traits> void CPMA<traits>::grow_list(uint64_t times) {
     underlying_array = aligned_alloc(32, allocated_size);
   }
   if constexpr (!binary) {
-    get_data_ptr(-1).set_and_zero(zero_element);
+    get_zero_el_ptr().set_and_zero(zero_element);
   } else {
     std::get<0>(get_data_ref(soa_num_spots())) = 0;
   }
@@ -1520,17 +1727,23 @@ template <typename traits> void CPMA<traits>::grow_list(uint64_t times) {
   ParallelTools::par_do(
       [old_array]() { free(old_array); },
       [&]() {
-        merged_data.leaf.template split<head_form == InPlace, store_density,
-                                        support_rank, parallel>(
-            total_leaves(), merged_data.size, logN(), get_data_ptr(0), 0,
-            [this](uint64_t index) -> element_ref_type {
-              return index_to_head(index);
-            },
-            density_array(), rank_tree_array(), total_leaves());
+        merged_data.leaf
+            .template split<head_form == InPlace, store_density, support_rank,
+                            parallel, traits::maintain_offsets>(
+                total_leaves(), merged_data.size, logN(), get_data_ptr(0), 0,
+                [this](uint64_t index) -> element_ref_type {
+                  return index_to_head(index);
+                },
+                density_array(), rank_tree_array(), total_leaves(),
+                offsets_array);
       });
 
   split_timer.stop();
   merged_data.free();
+  if constexpr (traits::maintain_offsets) {
+    offsets_array.locations[offsets_array.size - 1] =
+        data_array() + soa_num_spots();
+  }
 #if DEBUG == 1
   for (uint64_t i = 0; i < N(); i += logN()) {
     ASSERT(get_density_count(i, logN()) <= logN() - leaf::max_element_size,
@@ -1538,9 +1751,16 @@ template <typename traits> void CPMA<traits>::grow_list(uint64_t times) {
            get_density_count(i, logN()), logN() - leaf::max_element_size,
            merged_data.size, total_leaves(), i / logN());
   }
-  if constexpr (!compressed) {
+  if constexpr (!compressed && !traits::maintain_offsets) {
     for (uint64_t i = 0; i < total_leaves(); i++) {
       assert(get_leaf(i).check_increasing_or_zero());
+    }
+  }
+  if constexpr (!compressed && traits::maintain_offsets) {
+    for (size_t i = 0; i < offsets_array.size - 1; i++) {
+      void *loc = offsets_array.locations[i];
+      key_type *loc2 = reinterpret_cast<key_type *>(loc);
+      assert((*loc2) == (pcsr_top_bit | i));
     }
   }
 #endif
@@ -1563,7 +1783,7 @@ template <typename traits> void CPMA<traits>::shrink_list(uint64_t times) {
   // TODO(wheatman) deal with the fact that we copy the element here
   element_type zero_element;
   if constexpr (!binary) {
-    zero_element = get_data_ref(-1);
+    zero_element = get_zero_el_ref();
   }
   // assert(merged_data.leaf.head != 0 ||
   //        merged_data.leaf.template used_size<head_form == InPlace>() == 0);
@@ -1578,7 +1798,7 @@ template <typename traits> void CPMA<traits>::shrink_list(uint64_t times) {
     underlying_array = aligned_alloc(32, allocated_size);
   }
   if constexpr (!binary) {
-    get_data_ref(-1) = zero_element;
+    get_zero_el_ref() = zero_element;
   } else {
     std::get<0>(get_data_ref(soa_num_spots())) = 0;
   }
@@ -1592,14 +1812,19 @@ template <typename traits> void CPMA<traits>::shrink_list(uint64_t times) {
               rank_tree_array() + nextPowerOf2(total_leaves()), 0);
   }
 
-  merged_data.leaf.template split<head_form == InPlace, store_density,
-                                  support_rank, parallel>(
-      total_leaves(), merged_data.size, logN(), get_data_ptr(0), 0,
-      [this](uint64_t index) -> element_ref_type {
-        return index_to_head(index);
-      },
-      density_array(), rank_tree_array(), total_leaves());
+  merged_data.leaf
+      .template split<head_form == InPlace, store_density, support_rank,
+                      parallel, traits::maintain_offsets>(
+          total_leaves(), merged_data.size, logN(), get_data_ptr(0), 0,
+          [this](uint64_t index) -> element_ref_type {
+            return index_to_head(index);
+          },
+          density_array(), rank_tree_array(), total_leaves(), offsets_array);
   merged_data.free();
+  if constexpr (traits::maintain_offsets) {
+    offsets_array.locations[offsets_array.size - 1] =
+        data_array() + soa_num_spots();
+  }
 }
 
 template <typename traits>
@@ -1764,7 +1989,7 @@ uint64_t CPMA<traits>::find_containing_leaf_index(key_type e, uint64_t start,
                      find_containing_leaf_index_debug(e, start, end),
                  "got %lu, expected %lu", value_to_check * elts_per_leaf(),
                  find_containing_leaf_index_debug(e, start, end));
-          __builtin_prefetch(&data_array()[value_to_check * (elts_per_leaf())]);
+          __builtin_prefetch(&key_array()[value_to_check * (elts_per_leaf())]);
           return value_to_check * elts_per_leaf();
         }
         if (e <= static_cast<key_type>(head_array()[e_index] - 1)) {
@@ -1787,7 +2012,7 @@ uint64_t CPMA<traits>::find_containing_leaf_index(key_type e, uint64_t start,
                  find_containing_leaf_index_debug(e, start, end),
              "got %lu, expected %lu\n", value_to_check * elts_per_leaf(),
              find_containing_leaf_index_debug(e, start, end));
-      __builtin_prefetch(&data_array()[value_to_check * (elts_per_leaf())]);
+      __builtin_prefetch(&key_array()[value_to_check * (elts_per_leaf())]);
       return value_to_check * elts_per_leaf();
     } else {
       uint64_t length = total_leaves_rounded_up();
@@ -1816,7 +2041,7 @@ uint64_t CPMA<traits>::find_containing_leaf_index(key_type e, uint64_t start,
                      find_containing_leaf_index_debug(e, start, end),
                  "got %lu, expected %lu\n", value_to_check * elts_per_leaf(),
                  find_containing_leaf_index_debug(e, start, end));
-          __builtin_prefetch(&data_array()[value_to_check * (elts_per_leaf())]);
+          __builtin_prefetch(&key_array()[value_to_check * (elts_per_leaf())]);
           return value_to_check * elts_per_leaf();
         }
         if (e <= static_cast<key_type>(head_array()[e_index] - 1)) {
@@ -1845,7 +2070,7 @@ uint64_t CPMA<traits>::find_containing_leaf_index(key_type e, uint64_t start,
              value_to_check * elts_per_leaf(),
              find_containing_leaf_index_debug(e, start, end), elts_per_leaf(),
              start, end);
-      __builtin_prefetch(&data_array()[value_to_check * (elts_per_leaf())]);
+      __builtin_prefetch(&key_array()[value_to_check * (elts_per_leaf())]);
       return value_to_check * elts_per_leaf();
     }
   }
@@ -1947,7 +2172,7 @@ uint64_t CPMA<traits>::find_containing_leaf_index(key_type e, uint64_t start,
                  find_containing_leaf_index_debug(e, start, end),
              "got %lu, expected %lu\n", leaf_index * elts_per_leaf(),
              find_containing_leaf_index_debug(e, start, end));
-      __builtin_prefetch(&data_array()[leaf_index * (elts_per_leaf())]);
+      __builtin_prefetch(&key_array()[leaf_index * (elts_per_leaf())]);
       return leaf_index * elts_per_leaf();
     }
 
@@ -2006,7 +2231,7 @@ uint64_t CPMA<traits>::find_containing_leaf_index(key_type e, uint64_t start,
            leaf_index * elts_per_leaf(),
            find_containing_leaf_index_debug(e, start, end), start, end,
            leaf_index, elts_per_leaf(), total_leaves());
-    __builtin_prefetch(&data_array()[leaf_index * (elts_per_leaf())]);
+    __builtin_prefetch(&key_array()[leaf_index * (elts_per_leaf())]);
     return leaf_index * elts_per_leaf();
   }
   ASSERT(end > start, "end = %lu, start = %lu\n", end, start);
@@ -2038,11 +2263,11 @@ uint64_t CPMA<traits>::find_containing_leaf_index(key_type e, uint64_t start,
   uint64_t end_linear = std::min(linear_cutoff, step);
   for (uint64_t i = 1; i < end_linear; i++) {
     if (index_to_head_key(idx + i) > e) {
-      __builtin_prefetch(&data_array()[(idx + i - 1) * (elts_per_leaf())]);
+      __builtin_prefetch(&key_array()[(idx + i - 1) * (elts_per_leaf())]);
       return (idx + i - 1) * (elts_per_leaf());
     }
   }
-  __builtin_prefetch(&data_array()[(idx + end_linear - 1) * (elts_per_leaf())]);
+  __builtin_prefetch(&key_array()[(idx + end_linear - 1) * (elts_per_leaf())]);
   return (idx + end_linear - 1) * (elts_per_leaf());
 }
 
@@ -2078,7 +2303,7 @@ template <typename traits> void CPMA<traits>::print_pma() const {
   if (has_0) {
     printf("has 0\n");
     if constexpr (!binary) {
-      std::cout << "value of 0 is " << leftshift_tuple(get_data_ref(-1))
+      std::cout << "value of 0 is " << leftshift_tuple(get_zero_el_ref())
                 << "\n";
     }
   }
@@ -2090,6 +2315,7 @@ template <typename traits> void CPMA<traits>::print_pma() const {
 }
 
 template <typename traits> CPMA<traits>::CPMA() {
+  static_assert(!traits::maintain_offsets);
   if constexpr (!fixed_size) {
     uint64_t allocated_size = underlying_array_size() + 32;
     if (allocated_size % 32 != 0) {
@@ -2103,6 +2329,7 @@ template <typename traits> CPMA<traits>::CPMA() {
 }
 
 template <typename traits> CPMA<traits>::CPMA(key_type *start, key_type *end) {
+  static_assert(!traits::maintain_offsets);
   if constexpr (!fixed_size) {
     uint64_t allocated_size = underlying_array_size() + 32;
     if (allocated_size % 32 != 0) {
@@ -2136,7 +2363,7 @@ typename traits::value_type CPMA<traits>::value(key_type e) const {
   if (e == 0) {
     if (has_0) {
       // if we have a zero its stored right before the normal data
-      return leftshift_tuple(get_data_ref(-1));
+      return leftshift_tuple(get_zero_el_ref());
     } else {
       return {};
     }
@@ -2340,7 +2567,9 @@ uint64_t CPMA<traits>::insert_batch_internal_small_batch(
         find_containing_leaf_number(e.get(), start_leaf_idx, end_leaf_idx);
     auto [inserted, bytes_used] =
         get_leaf(leaf_number)
-            .template insert<head_form == InPlace, value_update>(*e);
+            .template insert<head_form == InPlace, value_update,
+                             traits::maintain_offsets>(*e, value_update(),
+                                                       offsets_array);
     if (!inserted) {
       return 0;
     }
@@ -2371,9 +2600,10 @@ uint64_t CPMA<traits>::insert_batch_internal_small_batch(
       auto result =
           get_leaf(start_leaf_idx / elts_per_leaf())
               .template merge_into_leaf<head_form == InPlace, parallel,
-                                        value_update>(
+                                        value_update, traits::maintain_offsets>(
                   e, e.get_pointer() + batch_size,
-                  index_to_head_key((start_leaf_idx / elts_per_leaf()) + 1));
+                  index_to_head_key((start_leaf_idx / elts_per_leaf()) + 1),
+                  value_update(), offsets_array);
       num_elts_merged += std::get<1>(result);
 
       if constexpr (support_rank) {
@@ -2430,10 +2660,12 @@ uint64_t CPMA<traits>::insert_batch_internal_small_batch(
     next_head = index_to_head_key((leaf_idx / elts_per_leaf()) + 1);
   }
   assert(middle.get() < next_head);
-  auto result = get_leaf(leaf_idx / elts_per_leaf())
-                    .template merge_into_leaf<head_form == InPlace, parallel,
-                                              value_update>(
-                        middle, e.get_pointer() + batch_size, next_head);
+  auto result =
+      get_leaf(leaf_idx / elts_per_leaf())
+          .template merge_into_leaf<head_form == InPlace, parallel,
+                                    value_update, traits::maintain_offsets>(
+              middle, e.get_pointer() + batch_size, next_head, value_update(),
+              offsets_array);
   // the middle element should have been merged in
   assert(std::get<0>(result) > e + (batch_size / 2));
   num_elts_merged += std::get<1>(result);
@@ -2525,7 +2757,9 @@ uint64_t CPMA<traits>::remove_batch_internal_small_batch(
     uint64_t leaf_number =
         find_containing_leaf_number(*e, start_leaf_idx, end_leaf_idx);
     auto [removed, bytes_used] =
-        get_leaf(leaf_number).template remove<head_form == InPlace>(*e);
+        get_leaf(leaf_number)
+            .template remove<head_form == InPlace, traits::maintain_offsets>(
+                *e, offsets_array);
     if (!removed) {
       return 0;
     }
@@ -3341,24 +3575,29 @@ CPMA<traits>::get_ranges_to_redistibute(
 #endif
     ParallelTools::Reducer_Vector<std::tuple<uint64_t, uint64_t>>
         elements_reduce;
-    ranges_to_redistribute_2.for_each(
-        [&](uint64_t child_range_start, uint64_t child_byte_count) {
-          if (child_byte_count == 0) {
-            return;
-          }
-          uint64_t node_size = (child_byte_count / sizeof(key_type)) * 2;
-          while (node_size <= N() / sizeof(key_type)) {
-            uint64_t node_start = find_node(child_range_start, node_size);
-            uint64_t length =
-                ranges_to_redistribute_2.unlocked_value(node_start, 0);
-            if (length != child_byte_count &&
-                node_start + length / sizeof(key_type) > child_range_start) {
+    if (ranges_to_redistribute_2.unlocked_value(0, 0) >= N()) {
+      elements_reduce.push_back({0, N()});
+    } else {
+
+      ranges_to_redistribute_2.for_each(
+          [&](uint64_t child_range_start, uint64_t child_byte_count) {
+            if (child_byte_count == 0) {
               return;
             }
-            node_size *= 2;
-          }
-          elements_reduce.push_back({child_range_start, child_byte_count});
-        });
+            uint64_t node_size = (child_byte_count / sizeof(key_type)) * 2;
+            while (node_size <= N() / sizeof(key_type)) {
+              uint64_t node_start = find_node(child_range_start, node_size);
+              uint64_t length =
+                  ranges_to_redistribute_2.unlocked_value(node_start, 0);
+              if (length != child_byte_count &&
+                  node_start + length / sizeof(key_type) > child_range_start) {
+                return;
+              }
+              node_size *= 2;
+            }
+            elements_reduce.push_back({child_range_start, child_byte_count});
+          });
+    }
     finish_up.stop();
     // _sync;
 
@@ -3601,14 +3840,15 @@ void CPMA<traits>::redistribute_ranges(
 
     // number of leaves, num elemtns in input leaf, num elements in
     // output leaf, dest region
-    merged_data.leaf.template split<head_form == InPlace, store_density,
-                                    support_rank, parallel>(
-        len / logN(), merged_data.size, logN(), get_data_ptr(start),
-        start / elts_per_leaf(),
-        [this](uint64_t index) -> element_ref_type {
-          return index_to_head(index);
-        },
-        density_array(), rank_tree_array(), total_leaves());
+    merged_data.leaf
+        .template split<head_form == InPlace, store_density, support_rank,
+                        parallel, traits::maintain_offsets>(
+            len / logN(), merged_data.size, logN(), get_data_ptr(start),
+            start / elts_per_leaf(),
+            [this](uint64_t index) -> element_ref_type {
+              return index_to_head(index);
+            },
+            density_array(), rank_tree_array(), total_leaves(), offsets_array);
     merged_data.free();
   }
 }
@@ -3636,14 +3876,15 @@ void CPMA<traits>::redistribute_ranges(
 
     // number of leaves, num elemtns in input leaf, num elements in
     // output leaf, dest region
-    merged_data.leaf.template split<head_form == InPlace, store_density,
-                                    support_rank, parallel>(
-        len / logN(), merged_data.size, logN(), get_data_ptr(start),
-        start / elts_per_leaf(),
-        [this](uint64_t index) -> element_ref_type {
-          return index_to_head(index);
-        },
-        density_array(), rank_tree_array(), total_leaves());
+    merged_data.leaf
+        .template split<head_form == InPlace, store_density, support_rank,
+                        parallel, traits::maintain_offsets>(
+            len / logN(), merged_data.size, logN(), get_data_ptr(start),
+            start / elts_per_leaf(),
+            [this](uint64_t index) -> element_ref_type {
+              return index_to_head(index);
+            },
+            density_array(), rank_tree_array(), total_leaves(), offsets_array);
     merged_data.free();
   });
 }
@@ -3693,12 +3934,12 @@ uint64_t CPMA<traits>::insert_batch(element_ptr_type e, uint64_t batch_size,
 
   // TODO(wheatman) currently only works for unsigned types
   while (e.get() == 0) {
-    if (has_0) {
-      if constexpr (!binary) {
-        value_update()(get_data_ref(-1), e[0]);
+    if constexpr (!binary) {
+      if (has_0) {
+        value_update()(get_zero_el_ref(), e[0]);
+      } else {
+        get_zero_el_ref() = e[0];
       }
-    } else {
-      get_data_ref(-1) = e[0];
     }
     inserted_zero = true;
     has_0 = true;
@@ -3961,7 +4202,7 @@ uint64_t CPMA<traits>::remove_batch(key_type *e, uint64_t batch_size,
   while (*e == 0) {
     has_0 = false;
     if constexpr (!binary) {
-      get_data_ref(-1) = element_type();
+      get_zero_el_ref() = element_type();
     }
     e += 1;
     batch_size -= 1;
@@ -4042,7 +4283,7 @@ uint64_t CPMA<traits>::remove_batch(key_type *e, uint64_t batch_size,
 
     auto ranges_pair = get_ranges_to_redistibute(
         leaves_to_check, num_elts_removed, [&](uint64_t level, float density) {
-          return (density < lower_density_bound(level)) || (density == 0);
+          return (density < lower_density_bound(level));
         });
     auto ranges_to_redistribute_3 = ranges_pair.first;
 
@@ -4143,7 +4384,7 @@ uint64_t CPMA<traits>::remove_batch(key_type *e, uint64_t batch_size,
 
     auto ranges_pair = get_ranges_to_redistibute(
         leaves_to_check, num_elts_removed, [&](uint64_t level, float density) {
-          return (density < lower_density_bound(level)) || (density == 0);
+          return (density < lower_density_bound(level));
         });
     auto ranges_to_redistribute_3 = ranges_pair.first;
 
@@ -4268,15 +4509,16 @@ void CPMA<traits>::insert_post_place(uint64_t leaf_number,
             },
             density_array());
 
-    merged_data.leaf.template split<head_form == InPlace, store_density,
-                                    support_rank, parallel>(
-        local_len_bytes / logN(), merged_data.size, logN(),
-        get_data_ptr(node_byte_index / sizeof(key_type)),
-        node_byte_index / logN(),
-        [this](uint64_t index) -> element_ref_type {
-          return index_to_head(index);
-        },
-        density_array(), rank_tree_array(), total_leaves());
+    merged_data.leaf
+        .template split<head_form == InPlace, store_density, support_rank,
+                        parallel, traits::maintain_offsets>(
+            local_len_bytes / logN(), merged_data.size, logN(),
+            get_data_ptr(node_byte_index / sizeof(key_type)),
+            node_byte_index / logN(),
+            [this](uint64_t index) -> element_ref_type {
+              return index_to_head(index);
+            },
+            density_array(), rank_tree_array(), total_leaves(), offsets_array);
     assert(check_rank_array());
 #if DEBUG == 1
     uint64_t start = node_byte_index;
@@ -4325,9 +4567,9 @@ template <typename traits> bool CPMA<traits>::insert(element_type e) {
     bool had_before = has_0;
     if constexpr (!binary) {
       if (had_before) {
-        value_update()(get_data_ref(-1), e);
+        value_update()(get_zero_el_ref(), e);
       } else {
-        get_data_ref(-1) = e;
+        get_zero_el_ref() = std::move(e);
       }
     }
     has_0 = true;
@@ -4340,7 +4582,9 @@ template <typename traits> bool CPMA<traits>::insert(element_type e) {
   modify_timer.start();
   auto [inserted, byte_count] =
       get_leaf(leaf_number)
-          .template insert<head_form == InPlace, value_update>(e);
+          .template insert<head_form == InPlace, value_update,
+                           traits::maintain_offsets>(
+              std::move(e), value_update(), offsets_array);
   modify_timer.stop();
 
   if (!inserted) {
@@ -4535,15 +4779,16 @@ void CPMA<traits>::remove_post_place(uint64_t leaf_number,
             },
             density_array());
 
-    merged_data.leaf.template split<head_form == InPlace, store_density,
-                                    support_rank, parallel>(
-        local_len_bytes / logN(), merged_data.size, logN(),
-        get_data_ptr(node_byte_index / sizeof(key_type)),
-        node_byte_index / logN(),
-        [this](uint64_t index) -> element_ref_type {
-          return index_to_head(index);
-        },
-        density_array(), rank_tree_array(), total_leaves());
+    merged_data.leaf
+        .template split<head_form == InPlace, store_density, support_rank,
+                        parallel, traits::maintain_offsets>(
+            local_len_bytes / logN(), merged_data.size, logN(),
+            get_data_ptr(node_byte_index / sizeof(key_type)),
+            node_byte_index / logN(),
+            [this](uint64_t index) -> element_ref_type {
+              return index_to_head(index);
+            },
+            density_array(), rank_tree_array(), total_leaves(), offsets_array);
     merged_data.free();
     assert(check_rank_array());
   }
@@ -4562,7 +4807,7 @@ template <typename traits> bool CPMA<traits>::remove(key_type e) {
   if (e == 0) {
     bool had_before = has_0;
     if constexpr (!binary) {
-      get_data_ref(-1) = element_type();
+      get_zero_el_ref() = element_type();
     }
     has_0 = false;
     return had_before;
@@ -4573,7 +4818,9 @@ template <typename traits> bool CPMA<traits>::remove(key_type e) {
   find_timer.stop();
   modify_timer.start();
   auto [removed, byte_count] =
-      get_leaf(leaf_number).template remove<head_form == InPlace>(e);
+      get_leaf(leaf_number)
+          .template remove<head_form == InPlace, traits::maintain_offsets>(
+              e, offsets_array);
   modify_timer.stop();
 
   if (!removed) {
@@ -4753,7 +5000,7 @@ typename traits::element_type CPMA<traits>::select(uint64_t rank) const {
       if constexpr (binary) {
         return 0;
       } else {
-        get_data_ref(-1);
+        get_zero_el_ref();
       }
     }
   }
@@ -4935,7 +5182,7 @@ bool CPMA<traits>::map(F f) const {
       if constexpr (binary) {
         f(0);
       } else {
-        f(get_data_ref(-1));
+        f(get_zero_el_ref());
       }
     } else {
       if constexpr (binary) {
@@ -4943,7 +5190,7 @@ bool CPMA<traits>::map(F f) const {
           return true;
         }
       } else {
-        if (f(get_data_ref(-1))) {
+        if (f(get_zero_el_ref())) {
           return true;
         }
       }
@@ -4971,7 +5218,7 @@ bool CPMA<traits>::parallel_map(F f) const {
     if constexpr (binary) {
       f(0);
     } else {
-      f(get_data_ref(-1));
+      f(get_zero_el_ref());
     }
   }
   if (total_leaves() > 100) {
@@ -5199,6 +5446,1343 @@ typename CPMA<traits>::key_type CPMA<traits>::split(CPMA<traits> *right) {
   new (right) CPMA<traits>();
   right->insert_batch(soa.get_ptr(0), total_elements - mid_point);
   return last_in_left_key;
+}
+
+// extra functions to help with PCSR
+template <typename traits>
+CPMA<traits>::CPMA([[maybe_unused]] make_pcsr tag, size_t num_nodes) {
+  static_assert(traits::maintain_offsets);
+
+  static_assert(!traits::compressed);
+  typename traits::SOA_type leaf_init(num_nodes);
+  ParallelTools::parallel_for(0, num_nodes, [&](size_t i) {
+    // the values for the sentinals are zero initialized
+    leaf_init.template get_ptr(i).zero();
+    std::get<0>(leaf_init.template get<0>(i)) = i | pcsr_top_bit;
+  });
+  typename traits::leaf leaf(leaf_init.get(0), leaf_init.get_ptr(1),
+                             num_nodes * sizeof(key_type));
+
+  uint64_t grow_times = 0;
+  auto bytes_occupied = (num_nodes + 1) * sizeof(key_type);
+
+  // min bytes necessary to meet the density bound
+  // uint64_t bytes_required = bytes_occupied / upper_density_bound(0);
+  uint64_t bytes_required =
+      std::max(N() * growing_factor, bytes_occupied * growing_factor);
+
+  while (meta_data[grow_times].n <= bytes_required) {
+    grow_times += 1;
+  }
+  meta_data_index = grow_times;
+  has_0 = false;
+  count_elements_ = num_nodes;
+
+  // steal an extra few bytes to ensure we never read off the end
+  uint64_t allocated_size = underlying_array_size() + 32;
+  if (allocated_size % 32 != 0) {
+    allocated_size += 32 - (allocated_size % 32);
+  }
+  underlying_array = aligned_alloc(32, allocated_size);
+
+  if constexpr (head_form != InPlace) {
+    ParallelTools::parallel_for(0, (head_array_size() / sizeof(key_type)),
+                                [&](size_t i) { head_array()[i] = 0; });
+  }
+  offsets_array.locations =
+      (void **)malloc((num_nodes + 1) * sizeof(*(offsets_array.locations)));
+  offsets_array.size = num_nodes + 1;
+  offsets_array.locations[num_nodes] = data_array() + soa_num_spots();
+
+  offsets_array.degrees =
+      (key_type *)malloc((num_nodes + 1) * sizeof(*(offsets_array.degrees)));
+  ParallelTools::parallel_for(0, num_nodes,
+                              [&](size_t i) { offsets_array.degrees[i] = 0; });
+
+  leaf.template split<head_form == InPlace, store_density, support_rank,
+                      parallel, traits::maintain_offsets>(
+      total_leaves(), count_elements_, logN(), get_data_ptr(0), 0,
+      [this](uint64_t index) -> element_ref_type {
+        return index_to_head(index);
+      },
+      density_array(), rank_tree_array(), total_leaves(), offsets_array);
+#if DEBUG == 1
+  if constexpr (!compressed) {
+    for (size_t i = 0; i < num_nodes; i++) {
+      void *loc = offsets_array.locations[i];
+      key_type *loc2 = reinterpret_cast<key_type *>(loc);
+      assert((*loc2) == (pcsr_top_bit | i));
+    }
+  }
+#endif
+
+  assert(verify_pcsr_nodes());
+}
+template <typename traits>
+std::pair<uint64_t, bool>
+CPMA<traits>::get_info_from_raw_pointer(void *ptr) const {
+  assert(ptr != nullptr);
+  if constexpr (head_form != InPlace) {
+    // this would mean that the start of a region lines up with a leaf head
+    if (ptr < key_array()) {
+      if constexpr (head_form == Linear) {
+        size_t leaf_number = reinterpret_cast<key_type *>(ptr) - head_array();
+
+        ASSERT(leaf_number <= total_leaves(),
+               "leaf_number = %lu,  total_leaves() = %lu\n", leaf_number,
+               total_leaves());
+        return {leaf_number, true};
+      } else if constexpr (head_form == Eytzinger) {
+        size_t leaf_number_in_eyt_order =
+            reinterpret_cast<key_type *>(ptr) - head_array();
+        size_t leaf_number =
+            e_index_reverse(leaf_number_in_eyt_order, total_leaves());
+        ASSERT(leaf_number <= total_leaves(),
+               "leaf_number = %lu,  total_leaves() = %lu\n", leaf_number,
+               total_leaves());
+        return {leaf_number, true};
+      }
+      static_assert(head_form != BNary);
+      // TODO(wheatman) deal with getting back the leaf number when it is stored
+      // in bnary order
+    } else {
+      // the region points somewhere in the middle of a leaf
+      uintptr_t bytes_from_start =
+          reinterpret_cast<uint8_t *>(ptr) - ((uint8_t *)key_array());
+      ASSERT(bytes_from_start / logN() <= total_leaves(),
+             "bytes_from_start / logN() = %lu, total_leaves() = %lu\n",
+             bytes_from_start / logN(), total_leaves());
+      return {bytes_from_start / logN(), false};
+    }
+  } else {
+    // head_form == InPlace
+    // this was we don't need to worry about the heads being somewhere else
+    uintptr_t bytes_from_start =
+        reinterpret_cast<uint8_t *>(ptr) - ((uint8_t *)key_array());
+    bool is_head = (bytes_from_start % logN()) == 0;
+    assert(bytes_from_start / logN() <= total_leaves());
+    return {bytes_from_start / logN(), is_head};
+  }
+}
+
+template <typename traits>
+bool CPMA<traits>::insert_pcsr(typename traits::key_type src,
+                               typename traits::key_type dest, value_type val) {
+  element_type element = std::tuple_cat(std::tuple(dest), val);
+  static_assert(traits::maintain_offsets);
+  auto start_region = offsets_array.locations[src];
+  auto end_region = offsets_array.locations[src + 1];
+
+  const auto &[start_leaf, start_is_head] =
+      get_info_from_raw_pointer(start_region);
+  assert(start_leaf < total_leaves());
+
+  const auto &[end_leaf, end_is_head] = get_info_from_raw_pointer(end_region);
+  assert(end_leaf <= total_leaves());
+
+  // we don't need to worry much about the end, since we always read in order
+  // and sentinals are always bigger than data
+  size_t end_index = end_leaf * elts_per_leaf();
+  if (!end_is_head) {
+    // get to the next leaf
+    end_index += elts_per_leaf();
+  }
+
+  // // this is the simple case, we just need to find the search range and do
+  // the
+  // // normal thing
+  // if (start_is_head) {
+  //   uint64_t leaf_number = find_containing_leaf_number(
+  //       dest, start_leaf * elts_per_leaf(), end_index);
+  //   auto [inserted, byte_count] =
+  //       get_leaf(leaf_number)
+  //           .template insert<head_form == InPlace, value_update>(dest);
+  //   if (!inserted) {
+  //     return false;
+  //   }
+  //   insert_post_place(leaf_number, byte_count);
+  //   return true;
+  // }
+  // the start is not the head so we need to deal with a partial leaf
+  // first see if we are even going into the second leaf
+  if ((end_leaf > start_leaf + 1 || (end_leaf > start_leaf && !end_is_head)) &&
+      start_leaf + 1 < total_leaves()) {
+    // if we are going in to a second leaf, then check if we will be in that
+    // portion and can just insert like normal into the second portion
+    if (index_to_head_key(start_leaf + 1) <= dest) {
+      uint64_t leaf_number = find_containing_leaf_number(
+          dest, (start_leaf + 1) * elts_per_leaf(), end_index);
+      assert(leaf_number < total_leaves());
+      auto [inserted, byte_count] =
+          get_leaf(leaf_number)
+              .template insert<head_form == InPlace, value_update,
+                               traits::maintain_offsets>(
+                  element, value_update(), offsets_array);
+      if (!inserted) {
+        return false;
+      }
+      offsets_array.degrees[src] += 1;
+      insert_post_place(leaf_number, byte_count);
+      return true;
+    }
+  }
+  // std::cout << "inserting into the first leaf\n";
+  // we are in the first partial leaf
+  // just make a fake leaf and insert into it
+  static_assert(!traits::compressed);
+
+  if (start_is_head) {
+
+    typename traits::leaf l(*index_to_data(start_leaf),
+                            index_to_data(start_leaf) + 1,
+                            leaf_size_in_bytes() - sizeof(key_type));
+    auto [inserted, bad_byte_count] =
+        l.template insert<head_form == InPlace, value_update,
+                          traits::maintain_offsets>(element, value_update(),
+                                                    offsets_array);
+    if (!inserted) {
+      return false;
+    }
+    offsets_array.degrees[src] += 1;
+    insert_post_place(
+        start_leaf,
+        get_leaf(start_leaf).template used_size<head_form == InPlace>());
+    return true;
+
+  } else {
+    size_t elements_from_start =
+        reinterpret_cast<key_type *>(start_region) - key_array();
+    assert(*reinterpret_cast<key_type *>(start_region) == (pcsr_top_bit | src));
+    // +2 to account for moving past the sentinal and the fake head
+    size_t num_into_leaf = (elements_from_start % elts_per_leaf()) + 2;
+
+    typename traits::leaf l(get_data_ref(elements_from_start + 1),
+                            get_data_ptr(elements_from_start + 2),
+                            (elts_per_leaf() - num_into_leaf) *
+                                sizeof(key_type));
+
+    auto [inserted, bad_byte_count] =
+        l.template insert<head_form == InPlace, value_update,
+                          traits::maintain_offsets>(element, value_update(),
+                                                    offsets_array);
+    if (!inserted) {
+      return false;
+    }
+    offsets_array.degrees[src] += 1;
+    insert_post_place(
+        start_leaf,
+        get_leaf(start_leaf).template used_size<head_form == InPlace>());
+    return true;
+  }
+}
+
+template <typename traits>
+bool CPMA<traits>::remove_pcsr(typename traits::key_type src,
+                               typename traits::key_type dest) {
+  static_assert(traits::maintain_offsets);
+  auto start_region = offsets_array.locations[src];
+  auto end_region = offsets_array.locations[src + 1];
+
+  const auto &[start_leaf, start_is_head] =
+      get_info_from_raw_pointer(start_region);
+  assert(start_leaf < total_leaves());
+
+  const auto &[end_leaf, end_is_head] = get_info_from_raw_pointer(end_region);
+  assert(end_leaf <= total_leaves());
+
+  // we don't need to worry much about the end, since we always read in order
+  // and sentinals are always bigger than data
+  size_t end_index = end_leaf * elts_per_leaf();
+  if (!end_is_head) {
+    // get to the next leaf
+    end_index += elts_per_leaf();
+  }
+
+  // // this is the simple case, we just need to find the search range and do
+  // the
+  // // normal thing
+  // if (start_is_head) {
+  //   uint64_t leaf_number = find_containing_leaf_number(
+  //       dest, start_leaf * elts_per_leaf(), end_index);
+  //   auto [inserted, byte_count] =
+  //       get_leaf(leaf_number)
+  //           .template insert<head_form == InPlace, value_update>(dest);
+  //   if (!inserted) {
+  //     return false;
+  //   }
+  //   insert_post_place(leaf_number, byte_count);
+  //   return true;
+  // }
+  // the start is not the head so we need to deal with a partial leaf
+  // first see if we are even going into the second leaf
+  if ((end_leaf > start_leaf + 1 || (end_leaf > start_leaf && !end_is_head)) &&
+      start_leaf + 1 < total_leaves()) {
+    // if we are going in to a second leaf, then check if we will be in that
+    // portion and can just insert like normal into the second portion
+    if (index_to_head_key(start_leaf + 1) <= dest) {
+      uint64_t leaf_number = find_containing_leaf_number(
+          dest, (start_leaf + 1) * elts_per_leaf(), end_index);
+      assert(leaf_number < total_leaves());
+      auto [removed, byte_count] =
+          get_leaf(leaf_number)
+              .template remove<head_form == InPlace, traits::maintain_offsets>(
+                  dest, offsets_array);
+      if (!removed) {
+        return false;
+      }
+      offsets_array.degrees[src] -= 1;
+      remove_post_place(leaf_number, byte_count);
+      return true;
+    }
+  }
+  // std::cout << "inserting into the first leaf\n";
+  // we are in the first partial leaf
+  // just make a fake leaf and insert into it
+  static_assert(!traits::compressed);
+
+  if (start_is_head) {
+
+    typename traits::leaf l(*index_to_data(start_leaf),
+                            index_to_data(start_leaf) + 1,
+                            leaf_size_in_bytes() - sizeof(key_type));
+    auto [removed, bad_byte_count] =
+        l.template remove<head_form == InPlace, traits::maintain_offsets>(
+            dest, offsets_array);
+    if (!removed) {
+      return false;
+    }
+    offsets_array.degrees[src] -= 1;
+    remove_post_place(
+        start_leaf,
+        get_leaf(start_leaf).template used_size<head_form == InPlace>());
+    return true;
+
+  } else {
+    size_t elements_from_start =
+        reinterpret_cast<key_type *>(start_region) - key_array();
+    // +2 to account for moving past the sentinal and the fake head
+    size_t num_into_leaf = (elements_from_start % elts_per_leaf()) + 2;
+
+    typename traits::leaf l(get_data_ref(elements_from_start + 1),
+                            get_data_ptr(elements_from_start + 2),
+                            (elts_per_leaf() - num_into_leaf) *
+                                sizeof(key_type));
+
+    auto [removed, bad_byte_count] =
+        l.template remove<head_form == InPlace, traits::maintain_offsets>(
+            dest, offsets_array);
+    if (!removed) {
+      return false;
+    }
+    offsets_array.degrees[src] -= 1;
+    remove_post_place(
+        start_leaf,
+        get_leaf(start_leaf).template used_size<head_form == InPlace>());
+    return true;
+  }
+}
+
+template <typename traits>
+bool CPMA<traits>::contains_pcsr(typename traits::key_type src,
+                                 typename traits::key_type dest) const {
+  static_assert(traits::maintain_offsets);
+  auto start_region = offsets_array.locations[src];
+  auto end_region = offsets_array.locations[src + 1];
+
+  const auto &[start_leaf, start_is_head] =
+      get_info_from_raw_pointer(start_region);
+  assert(start_leaf < total_leaves());
+
+  const auto &[end_leaf, end_is_head] = get_info_from_raw_pointer(end_region);
+  assert(end_leaf <= total_leaves());
+
+  // we don't need to worry much about the end, since we always read in order
+  // and sentinals are always bigger than data
+  size_t end_index = end_leaf * elts_per_leaf();
+  if (!end_is_head) {
+    // get to the next leaf
+    end_index += elts_per_leaf();
+  }
+
+  // the start is not the head so we need to deal with a partial leaf
+  // first see if we are even going into the second leaf
+  if ((end_leaf > start_leaf + 1 || (end_leaf > start_leaf && !end_is_head)) &&
+      start_leaf + 1 < total_leaves()) {
+    // if we are going in to a second leaf, then check if we will be in that
+    // portion and can just insert like normal into the second portion
+    if (index_to_head_key(start_leaf + 1) <= dest) {
+      uint64_t leaf_number = find_containing_leaf_number(
+          dest, (start_leaf + 1) * elts_per_leaf(), end_index);
+      assert(leaf_number < total_leaves());
+      return get_leaf(leaf_number)
+          .template contains<head_form == InPlace>(dest);
+    }
+  }
+  // std::cout << "inserting into the first leaf\n";
+  // we are in the first partial leaf
+  // just make a fake leaf and insert into it
+  static_assert(!traits::compressed);
+
+  if (start_is_head) {
+
+    typename traits::leaf l(*index_to_data(start_leaf),
+                            index_to_data(start_leaf) + 1,
+                            leaf_size_in_bytes() - sizeof(key_type));
+    return l.template contains<head_form == InPlace>(dest);
+  } else {
+    size_t elements_from_start =
+        reinterpret_cast<key_type *>(start_region) - key_array();
+    // +2 to account for moving past the sentinal and the fake head
+    size_t num_into_leaf = (elements_from_start % elts_per_leaf()) + 2;
+
+    typename traits::leaf l(get_data_ref(elements_from_start + 1),
+                            get_data_ptr(elements_from_start + 2),
+                            (elts_per_leaf() - num_into_leaf) *
+                                sizeof(key_type));
+
+    return l.template contains<head_form == InPlace>(dest);
+  }
+}
+
+template <typename traits>
+template <bool no_early_exit, bool parallel, class F>
+void CPMA<traits>::map_neighbors_pcsr(key_type node, F f) const {
+  auto start_region = offsets_array.locations[node];
+  auto end_region = offsets_array.locations[node + 1];
+  const auto &[start_leaf, start_is_head] =
+      get_info_from_raw_pointer(start_region);
+
+  const auto &[end_leaf, end_is_head] = get_info_from_raw_pointer(end_region);
+  if (end_is_head) {
+    // reset the end rehion into the data array, since we never actually look at
+    // it and it makes the math easier
+    if constexpr (head_form == InPlace) {
+      end_region = index_to_data(end_leaf).get_pointer() - 1;
+    } else {
+      end_region = index_to_data(end_leaf).get_pointer();
+    }
+  }
+
+  // do the first leaf
+
+  bool single_leaf = start_leaf == end_leaf;
+
+  auto f2 = [&](const auto &el) {
+    ASSERT(element_or_first_element(el) <= num_nodes_pcsr(),
+           "std::get<0>(el) = %lu,  num_nodes_pcsr() = %lu\n",
+           static_cast<uint64_t>(element_or_first_element(el)),
+           static_cast<uint64_t>(num_nodes_pcsr()));
+    return f(node, el);
+  };
+
+  if (start_is_head) {
+    if (reinterpret_cast<uint8_t *>(index_to_data(start_leaf).get_pointer()) <
+        static_cast<uint8_t *>(end_region)) {
+      uint64_t leaf_size = static_cast<uint8_t *>(end_region) -
+                           reinterpret_cast<uint8_t *>(
+                               index_to_data(start_leaf).get_pointer() + 1);
+      if (!single_leaf) {
+        leaf_size = leaf_size_in_bytes() - sizeof(key_type);
+      }
+      assert(leaf_size < leaf_size_in_bytes());
+
+      typename traits::leaf first_leaf = leaf(
+          *index_to_data(start_leaf), index_to_data(start_leaf) + 1, leaf_size);
+      if (first_leaf.template map<no_early_exit>(f2)) {
+        return;
+      }
+    }
+
+  } else {
+    if (reinterpret_cast<key_type *>(start_region) + 1 < end_region) {
+      size_t elements_from_start =
+          reinterpret_cast<key_type *>(start_region) - key_array();
+      // +2 to account for moving past the sentinal and the fake head
+      size_t num_into_leaf = (elements_from_start % elts_per_leaf()) + 2;
+
+      uint64_t leaf_size = static_cast<uint8_t *>(end_region) -
+                           reinterpret_cast<uint8_t *>(
+                               reinterpret_cast<key_type *>(start_region) + 2);
+      if (!single_leaf) {
+        leaf_size = (elts_per_leaf() - num_into_leaf) * sizeof(key_type);
+      }
+
+      typename traits::leaf first_leaf =
+          leaf(get_data_ref(elements_from_start + 1),
+               get_data_ptr(elements_from_start + 2), leaf_size);
+      if (first_leaf.template map<no_early_exit>(f2)) {
+        return;
+      }
+    }
+  }
+
+  size_t start_leaf_idx = start_leaf + 1;
+  // if there is an leaves in the middle do them in parallel
+  if (start_leaf_idx < end_leaf) {
+    if constexpr (parallel) {
+      if (end_leaf - start_leaf_idx > 50) {
+        // don't bother to early exit in parallel
+        ParallelTools::parallel_for(
+            start_leaf_idx, end_leaf, [&](uint64_t idx) {
+              get_leaf(idx).template map<no_early_exit>(f2);
+            });
+      } else {
+        for (size_t idx = start_leaf_idx; idx < end_leaf; idx++) {
+          if (get_leaf(idx).template map<no_early_exit>(f2)) {
+            return;
+          }
+        }
+      }
+    } else {
+      for (size_t idx = start_leaf_idx; idx < end_leaf; idx++) {
+        if (get_leaf(idx).template map<no_early_exit>(f2)) {
+          return;
+        }
+      }
+    }
+  }
+  // do the last leaf
+  if (!end_is_head && !single_leaf && end_leaf < total_leaves()) {
+    typename traits::leaf last_leaf(
+        index_to_head(end_leaf), index_to_data(end_leaf),
+        static_cast<uint8_t *>(end_region) -
+            reinterpret_cast<uint8_t *>(index_to_data(end_leaf).get_pointer()));
+    last_leaf.template map<no_early_exit>(f2);
+  } else {
+  }
+}
+
+template <typename traits>
+template <std::ranges::random_access_range R, class Vector_pairs>
+uint64_t CPMA<traits>::insert_batch_internal_pcsr(
+    R &es, std::invocable<typename std::ranges::range_value_t<R>> auto &&f,
+    Vector_pairs &leaves_to_check, const uint64_t start_leaf_idx,
+    const uint64_t end_leaf_idx) {
+  // std::cout << "start_leaf_number = " << start_leaf_idx / elts_per_leaf()
+  //           << " end_leaf_number = " << end_leaf_idx / elts_per_leaf() <<
+  //           "\n";
+
+  uint64_t batch_size = es.size();
+  // not technically true, but true in practice
+  assert(batch_size < 1000000000000UL);
+  if (batch_size == 0) {
+    return 0;
+  }
+
+#if DEBUG == 1
+  {
+    auto element = es[0];
+    auto &element_src = std::get<0>(element);
+    auto start_region = offsets_array.locations[element_src];
+    auto end_region = offsets_array.locations[element_src + 1];
+    const auto &[start_leaf, start_is_head] =
+        get_info_from_raw_pointer(start_region);
+    const auto &[end_leaf, end_is_head] = get_info_from_raw_pointer(end_region);
+    assert(std::max(start_leaf, end_leaf) >= start_leaf_idx / elts_per_leaf());
+    assert(std::min(start_leaf, end_leaf) <= end_leaf_idx / elts_per_leaf());
+  }
+  {
+    auto element = es[es.size() - 1];
+    auto &element_src = std::get<0>(element);
+    auto start_region = offsets_array.locations[element_src];
+    auto end_region = offsets_array.locations[element_src + 1];
+    const auto &[start_leaf, start_is_head] =
+        get_info_from_raw_pointer(start_region);
+    const auto &[end_leaf, end_is_head] = get_info_from_raw_pointer(end_region);
+    assert(std::max(start_leaf, end_leaf) >= start_leaf_idx / elts_per_leaf());
+    assert(std::min(start_leaf, end_leaf) <= end_leaf_idx / elts_per_leaf());
+  }
+#endif
+
+  uint64_t num_elts_merged = 0;
+  // TODO(wheatman) maybe special case batch small batch sizes and dense batch
+  // sizes
+  int64_t middle_index = es.size() / 2;
+  auto middle_element = f(es[middle_index]);
+  auto &middle_element_src = std::get<0>(middle_element);
+  auto &middle_element_dest = std::get<1>(middle_element);
+  auto start_region = offsets_array.locations[middle_element_src];
+  auto end_region = offsets_array.locations[middle_element_src + 1];
+
+  const auto &[start_leaf_saved, start_is_head_saved] =
+      get_info_from_raw_pointer(start_region);
+  auto start_leaf = start_leaf_saved;
+  assert(start_leaf < total_leaves());
+
+  const auto &[end_leaf_saved, end_is_head_saved] =
+      get_info_from_raw_pointer(end_region);
+  auto end_leaf = end_leaf_saved;
+  auto end_is_head = end_is_head_saved;
+  assert(end_leaf <= total_leaves());
+  if (!end_is_head) {
+    // get to the next leaf
+    end_leaf += 1;
+  }
+  // if the recursion gives us something more restrictive at the end just take
+  // it
+  if (end_leaf_idx / elts_per_leaf() < end_leaf) {
+    end_leaf = end_leaf_idx / elts_per_leaf();
+    end_is_head = false;
+  }
+
+  // either we are on the first leaf and we special case it, or we are in a
+  // latter leaf and it should be easy
+
+  uint64_t leaf_number;
+  auto next_head_src = middle_element_src;
+  auto this_head_src = middle_element_src;
+
+  // first check that there is a second leaf, which is either that end_leaf >=
+  // start_leaf+2 so there is something in the middle, or itys just greater
+  // (meaning might only be one), but in this case we also need the end not to
+  // be the head, since that means we can't actually insert it there.  Next we
+  // check that we are not the last leaf.  Now we know that there is another
+  // leaf we can check if the head of that second leaf  is less than or equal to
+  // our dest, this means we can ignore the first leaf and just do a normal case
+  if ((end_leaf > start_leaf + 1) && start_leaf + 1 < total_leaves() &&
+      index_to_head_key(start_leaf + 1) <= middle_element_dest) {
+    start_leaf += 1;
+    if (start_leaf < start_leaf_idx / elts_per_leaf()) {
+      start_leaf = start_leaf_idx / elts_per_leaf();
+    }
+    if (start_leaf < end_leaf) {
+      leaf_number = find_containing_leaf_number(middle_element_dest,
+                                                start_leaf * elts_per_leaf(),
+                                                end_leaf * elts_per_leaf());
+    } else {
+      // std::cout << "start_leaf = end_leaf\n";
+      leaf_number = end_leaf;
+    }
+
+    // since we are the second leaf of the node, we can't be the first leaf
+    // overall
+    assert(leaf_number > 0);
+
+    key_type head = index_to_head_key(leaf_number);
+    // now we need to walk backwords in the batch to find the first element in
+    // the batch that goes to this same leaf keep in mind that this cannot be
+    // for a different node since we are at least in the second leaf of a node
+    // in this case
+
+    while (middle_index > 0) {
+
+      if (head < pcsr_top_bit) {
+        if (std::get<1>(f(es[middle_index - 1])) < head) {
+          break;
+        }
+      }
+      if (std::get<0>(f(es[middle_index - 1])) != middle_element_src) {
+        break;
+      }
+
+      middle_index -= 1;
+    }
+  } else {
+    // we know we are in the first leaf of a range
+    leaf_number = start_leaf;
+    if (leaf_number < start_leaf_idx / elts_per_leaf()) {
+      leaf_number = start_leaf_idx / elts_per_leaf();
+    }
+
+    // we need to walk backwords to find the start of the leaf, dealing with
+    // seninals and knowing what the new starting src is
+
+#if DEBUG == 1
+    size_t counter = 0;
+#endif
+
+    while (this_head_src > 0 &&
+           std::get<0>(get_info_from_raw_pointer(
+               offsets_array.locations[this_head_src])) == leaf_number &&
+           get_info_from_raw_pointer(offsets_array.locations[this_head_src]) !=
+               std::pair(leaf_number, true)) {
+      this_head_src -= 1;
+#if DEBUG == 1
+      // just make sure this soesn't turn into an infinite loop, there could
+      // be at most max number of elements, which could be up to num bytes
+      // sentinals in this leaf
+      counter += 1;
+      assert(counter < logN());
+#endif
+    }
+
+    // then we need to walk back in the batch to find the first element that
+    // will go into this leaf now that we know the starting source
+    key_type head = index_to_head_key(leaf_number);
+    if (head >= pcsr_top_bit) {
+      while (middle_index > 0 &&
+             std::get<0>(f(es[middle_index - 1])) >= this_head_src) {
+        middle_index -= 1;
+      }
+    } else {
+      while (middle_index > 0) {
+        auto batch_element = f(es[middle_index - 1]);
+        if (std::get<0>(batch_element) == this_head_src &&
+            std::get<1>(batch_element) < head) {
+          break;
+        }
+        if (std::get<0>(batch_element) < this_head_src) {
+          break;
+        }
+        middle_index -= 1;
+      }
+    }
+  }
+
+  key_type next_head_dest =
+      std::numeric_limits<key_type>::max() >> 1; // max int
+  if (leaf_number + 1 < end_leaf_idx / elts_per_leaf()) {
+    next_head_dest = index_to_head_key(leaf_number + 1);
+    assert(next_head_dest != 0);
+    // this might actually be a sentinal, but thats fine, since in that case its
+    // part of the next node and the src will will us to add what we should
+  }
+
+// in this case we need to figure out what source controls the head of the
+// next leaf, we can just walk forward in the offsets array to do this
+#if DEBUG == 1
+  size_t counter = 0;
+#endif
+  while (
+      next_head_src < num_nodes_pcsr() &&
+      (std::get<0>(get_info_from_raw_pointer(
+           offsets_array.locations[next_head_src + 1])) == leaf_number ||
+       get_info_from_raw_pointer(offsets_array.locations[next_head_src + 1]) ==
+           std::pair(leaf_number + 1, true))) {
+    next_head_src += 1;
+#if DEBUG == 1
+    // just make sure this soesn't turn into an infinite loop, there could
+    // be at most max number of elements, which could be up to num bytes
+    // sentinals in this leaf
+    counter += 1;
+    assert(counter < logN());
+#endif
+  }
+  auto subrange = std::ranges::subrange(es.begin() + middle_index, es.end());
+  assert(leaf_number >= start_leaf_idx / elts_per_leaf());
+  auto result = get_leaf(leaf_number)
+                    .template merge_into_leaf_pcsr<head_form == InPlace,
+                                                   parallel, value_update,
+                                                   traits::maintain_offsets>(
+                        subrange, f, this_head_src, next_head_src,
+                        next_head_dest, value_update(), offsets_array);
+
+  static_assert(!support_rank);
+  num_elts_merged += std::get<1>(result);
+  auto bytes_used = std::get<2>(result);
+  auto index_merged_up_to = middle_index + std::get<0>(result);
+  assert(index_merged_up_to > middle_index);
+  if (std::get<1>(result)) {
+    static_assert(!store_density);
+    ASSERT(bytes_used ==
+               get_density_count(
+                   leaf_number * elts_per_leaf() * sizeof(key_type), logN()),
+           "got %lu, expected %lu\n", bytes_used,
+           get_density_count(leaf_number * elts_per_leaf() * sizeof(key_type),
+                             logN()));
+    if (bytes_used > logN() * upper_density_bound(H())) {
+      leaves_to_check.push_back({leaf_number * elts_per_leaf(), bytes_used});
+    }
+  }
+
+  // do the recursion splitting the batch into the early and the late
+
+  uint64_t ret1 = 0;
+  uint64_t ret2 = 0;
+
+  auto early_range =
+      std::ranges::subrange(es.begin(), es.begin() + middle_index);
+  auto late_range =
+      std::ranges::subrange(es.begin() + index_merged_up_to, es.end());
+
+  const auto early_range_start_leaf_idx = start_leaf_idx;
+  const auto early_range_end_leaf_idx = leaf_number * elts_per_leaf();
+  const auto late_range_start_leaf_idx = (leaf_number + 1) * elts_per_leaf();
+  const auto late_range_end_leaf_idx = end_leaf_idx;
+
+  if (early_range.size() == 0 && late_range.size() == 0) {
+    return num_elts_merged;
+  }
+  if (early_range.size() == 0) {
+    ret2 = insert_batch_internal_pcsr(late_range, f, leaves_to_check,
+                                      late_range_start_leaf_idx,
+                                      late_range_end_leaf_idx);
+  } else if (late_range.size() == 0) {
+    ret1 = insert_batch_internal_pcsr(early_range, f, leaves_to_check,
+                                      early_range_start_leaf_idx,
+                                      early_range_end_leaf_idx);
+  } else {
+    if constexpr (!parallel) {
+      ret1 = insert_batch_internal_pcsr(early_range, f, leaves_to_check,
+                                        early_range_start_leaf_idx,
+                                        early_range_end_leaf_idx);
+      ret2 = insert_batch_internal_pcsr(late_range, f, leaves_to_check,
+                                        late_range_start_leaf_idx,
+                                        late_range_end_leaf_idx);
+    } else {
+      if (early_range.size() <= 20 || late_range.size() <= 20) {
+        ret1 = insert_batch_internal_pcsr(early_range, f, leaves_to_check,
+                                          early_range_start_leaf_idx,
+                                          early_range_end_leaf_idx);
+        ret2 = insert_batch_internal_pcsr(late_range, f, leaves_to_check,
+                                          late_range_start_leaf_idx,
+                                          late_range_end_leaf_idx);
+      } else {
+        ParallelTools::par_do(
+            [&]() {
+              ret1 = insert_batch_internal_pcsr(early_range, f, leaves_to_check,
+                                                early_range_start_leaf_idx,
+                                                early_range_end_leaf_idx);
+            },
+            [&]() {
+              ret2 = insert_batch_internal_pcsr(late_range, f, leaves_to_check,
+                                                late_range_start_leaf_idx,
+                                                late_range_end_leaf_idx);
+            });
+      }
+    }
+  }
+
+  num_elts_merged += ret1;
+  num_elts_merged += ret2;
+  return num_elts_merged;
+}
+
+template <typename traits>
+template <std::ranges::random_access_range R>
+uint64_t CPMA<traits>::insert_batch_pcsr(
+    R &es, std::invocable<typename std::ranges::range_value_t<R>> auto &&f,
+    bool sorted) {
+  assert(verify_pcsr_nodes());
+
+  static_assert(!support_rank, "we don't support rank while doing pcsr stuff");
+  uint64_t batch_size = es.size();
+  if (batch_size < 100) {
+    uint64_t count = 0;
+    for (const auto &e : es) {
+      auto elem = f(e);
+      if constexpr (binary) {
+        count += insert_pcsr(std::get<0>(elem), std::get<1>(elem));
+      } else {
+        count += insert_pcsr(std::get<0>(elem), std::get<1>(elem),
+                             leftshift_tuple(leftshift_tuple(elem)));
+      }
+    }
+    return count;
+  }
+  // the sentinals will always already be there
+  assert(get_element_count() > 0);
+
+  // don't need to deal with zero since all of the elements will be greater
+  // than zero since we bump up the dests by 1, which is what the f function
+  // does in practice
+
+  if (!sorted) {
+    parlay::integer_sort_inplace(es, [](const auto &elem) {
+      return (static_cast<uint64_t>(std::get<0>(elem)) << 32U) |
+             std::get<1>(elem);
+    });
+  }
+  std::conditional_t<
+      parallel, ParallelTools::Reducer_Vector<std::pair<uint64_t, uint64_t>>,
+      std::vector<std::pair<uint64_t, uint64_t>>>
+      leaves_to_check;
+
+  uint64_t num_elts_merged = insert_batch_internal_pcsr(
+      es, f, leaves_to_check, 0, total_leaves() * elts_per_leaf());
+
+  // TODO(wheatman) maybe do this stuff in parallel with some other stuff if we
+  // need more parallelism
+  //  the batch has been marked with the high bit of the src marked if it was
+  //  actually inserted, use this to help update the degree array
+  // TODO(wheatman) this can probably be faster, but its simple and this should
+  // be a resonable approach
+  auto filtered =
+      parlay::map_maybe(es, [](const auto &elem) -> std::optional<key_type> {
+        if (std::get<0>(elem) >= pcsr_top_bit) {
+          return std::get<0>(elem) ^ pcsr_top_bit;
+        } else {
+          return {};
+        }
+      });
+  auto counts = parlay::histogram_by_key(filtered);
+  ParallelTools::parallel_for(0, counts.size(), [&](size_t i) {
+    offsets_array.degrees[counts[i].first] += counts[i].second;
+  });
+
+  ASSERT(num_elts_merged ==
+             parlay::delayed::reduce(parlay::delayed::map(
+                 counts, [](const auto &elem) { return elem.second; })),
+         "num_elts_removed = %lu, num_marked = %lu\n", num_elts_merged,
+         parlay::delayed::reduce(parlay::delayed::map(
+             counts, [](const auto &elem) { return elem.second; })));
+
+  auto [ranges_to_redistribute_3, full_opt] = get_ranges_to_redistibute(
+      leaves_to_check, num_elts_merged, [&](uint64_t level, float density) {
+        return density > upper_density_bound(level);
+      });
+  if (full_opt.has_value()) {
+
+    uint64_t grow_times = 0;
+    auto bytes_occupied = full_opt.value();
+    assert(bytes_occupied < 1UL << 60UL);
+
+    // min bytes necessary to meet the density bound
+    // uint64_t bytes_required = bytes_occupied / upper_density_bound(0);
+    uint64_t bytes_required =
+        std::max(N() * growing_factor, bytes_occupied * growing_factor);
+
+    while (meta_data[meta_data_index + grow_times].n <= bytes_required) {
+      grow_times += 1;
+    }
+
+    grow_list(grow_times);
+  } else { // not doubling
+    // in parallel, redistribute ranges
+    redistribute_ranges(ranges_to_redistribute_3);
+  }
+  count_elements_ += num_elts_merged;
+  assert(verify_pcsr_nodes());
+  assert(verify_pcsr_degrees());
+#if DEBUG == 1
+  size_t edge_count = 0;
+  for (size_t i = 0; i < num_nodes_pcsr(); i++) {
+    map_neighbors_pcsr<true, false>(
+        i, [&edge_count]([[maybe_unused]] auto arg1,
+                         [[maybe_unused]] auto arg2) { edge_count += 1; });
+  }
+  ASSERT(edge_count == num_edges_pcsr(),
+         "edge_count = %lu, num_edges_pcsr() = %lu\n", edge_count,
+         num_edges_pcsr());
+#endif
+  return num_elts_merged;
+}
+
+template <typename traits>
+template <std::ranges::random_access_range R, class Vector_pairs>
+uint64_t CPMA<traits>::remove_batch_internal_pcsr(
+    R &es, std::invocable<typename std::ranges::range_value_t<R>> auto &&f,
+    Vector_pairs &leaves_to_check, const uint64_t start_leaf_idx,
+    const uint64_t end_leaf_idx) {
+  if (start_leaf_idx == end_leaf_idx) {
+    return 0;
+  }
+  // std::cout << "start_leaf_number = " << start_leaf_idx / elts_per_leaf()
+  //           << " end_leaf_number = " << end_leaf_idx / elts_per_leaf() <<
+  //           "\n";
+
+  uint64_t batch_size = es.size();
+  // not technically true, but true in practice
+  assert(batch_size < 1000000000000UL);
+  if (batch_size == 0) {
+    return 0;
+  }
+
+#if DEBUG == 1
+  {
+    auto element = es[0];
+    auto &element_src = std::get<0>(element);
+    auto start_region = offsets_array.locations[element_src];
+    auto end_region = offsets_array.locations[element_src + 1];
+    const auto &[start_leaf, start_is_head] =
+        get_info_from_raw_pointer(start_region);
+    const auto &[end_leaf, end_is_head] = get_info_from_raw_pointer(end_region);
+    assert(std::max(start_leaf, end_leaf) >= start_leaf_idx / elts_per_leaf());
+    assert(std::min(start_leaf, end_leaf) <= end_leaf_idx / elts_per_leaf());
+  }
+  {
+    auto element = es[es.size() - 1];
+    auto &element_src = std::get<0>(element);
+    auto start_region = offsets_array.locations[element_src];
+    auto end_region = offsets_array.locations[element_src + 1];
+    const auto &[start_leaf, start_is_head] =
+        get_info_from_raw_pointer(start_region);
+    const auto &[end_leaf, end_is_head] = get_info_from_raw_pointer(end_region);
+    assert(std::max(start_leaf, end_leaf) >= start_leaf_idx / elts_per_leaf());
+    assert(std::min(start_leaf, end_leaf) <= end_leaf_idx / elts_per_leaf());
+  }
+#endif
+
+  uint64_t num_elts_removed = 0;
+  // TODO(wheatman) maybe special case batch small batch sizes and dense batch
+  // sizes
+  int64_t middle_index = es.size() / 2;
+  auto middle_element = f(es[middle_index]);
+  auto &middle_element_src = std::get<0>(middle_element);
+  auto &middle_element_dest = std::get<1>(middle_element);
+  auto start_region = offsets_array.locations[middle_element_src];
+  auto end_region = offsets_array.locations[middle_element_src + 1];
+
+  const auto &[start_leaf_saved, start_is_head_saved] =
+      get_info_from_raw_pointer(start_region);
+  auto start_leaf = start_leaf_saved;
+  assert(start_leaf < total_leaves());
+
+  const auto &[end_leaf_saved, end_is_head_saved] =
+      get_info_from_raw_pointer(end_region);
+  auto end_leaf = end_leaf_saved;
+  auto end_is_head = end_is_head_saved;
+  assert(end_leaf <= total_leaves());
+  if (!end_is_head) {
+    // get to the next leaf
+    end_leaf += 1;
+  }
+  // if the recursion gives us something more restrictive at the end just take
+  // it
+  if (end_leaf_idx / elts_per_leaf() < end_leaf) {
+    end_leaf = end_leaf_idx / elts_per_leaf();
+    end_is_head = false;
+  }
+
+  // either we are on the first leaf and we special case it, or we are in a
+  // latter leaf and it should be easy
+
+  uint64_t leaf_number;
+  auto next_head_src = middle_element_src;
+  auto this_head_src = middle_element_src;
+
+  // first check that there is a second leaf, which is either that end_leaf >=
+  // start_leaf+2 so there is something in the middle, or itys just greater
+  // (meaning might only be one), but in this case we also need the end not to
+  // be the head, since that means we can't actually insert it there.  Next we
+  // check that we are not the last leaf.  Now we know that there is another
+  // leaf we can check if the head of that second leaf  is less than or equal to
+  // our dest, this means we can ignore the first leaf and just do a normal case
+  if ((end_leaf > start_leaf + 1) && start_leaf + 1 < total_leaves() &&
+      index_to_head_key(start_leaf + 1) <= middle_element_dest) {
+    start_leaf += 1;
+    if (start_leaf < start_leaf_idx / elts_per_leaf()) {
+      start_leaf = start_leaf_idx / elts_per_leaf();
+    }
+    if (start_leaf < end_leaf) {
+      leaf_number = find_containing_leaf_number(middle_element_dest,
+                                                start_leaf * elts_per_leaf(),
+                                                end_leaf * elts_per_leaf());
+    } else {
+      // std::cout << "start_leaf = end_leaf\n";
+      leaf_number = end_leaf;
+    }
+
+    // since we are the second leaf of the node, we can't be the first leaf
+    // overall
+    assert(leaf_number > 0);
+
+    key_type head = index_to_head_key(leaf_number);
+    // now we need to walk backwords in the batch to find the first element in
+    // the batch that goes to this same leaf keep in mind that this cannot be
+    // for a different node since we are at least in the second leaf of a node
+    // in this case
+
+    while (middle_index > 0) {
+
+      if (head < pcsr_top_bit) {
+        if (std::get<1>(f(es[middle_index - 1])) < head) {
+          break;
+        }
+      }
+      if (std::get<0>(f(es[middle_index - 1])) != middle_element_src) {
+        break;
+      }
+
+      middle_index -= 1;
+    }
+  } else {
+    // we know we are in the first leaf of a range
+    leaf_number = start_leaf;
+    if (leaf_number < start_leaf_idx / elts_per_leaf()) {
+      leaf_number = start_leaf_idx / elts_per_leaf();
+    }
+
+    // we need to walk backwords to find the start of the leaf, dealing with
+    // seninals and knowing what the new starting src is
+
+#if DEBUG == 1
+    size_t counter = 0;
+#endif
+
+    while (this_head_src > 0 &&
+           std::get<0>(get_info_from_raw_pointer(
+               offsets_array.locations[this_head_src])) == leaf_number &&
+           get_info_from_raw_pointer(offsets_array.locations[this_head_src]) !=
+               std::pair(leaf_number, true)) {
+      this_head_src -= 1;
+#if DEBUG == 1
+      // just make sure this soesn't turn into an infinite loop, there could
+      // be at most max number of elements, which could be up to num bytes
+      // sentinals in this leaf
+      counter += 1;
+      assert(counter < logN());
+#endif
+    }
+
+    // then we need to walk back in the batch to find the first element that
+    // will go into this leaf now that we know the starting source
+    key_type head = index_to_head_key(leaf_number);
+    if (head >= pcsr_top_bit) {
+      while (middle_index > 0 &&
+             std::get<0>(f(es[middle_index - 1])) >= this_head_src) {
+        middle_index -= 1;
+      }
+    } else {
+      while (middle_index > 0) {
+        auto batch_element = f(es[middle_index - 1]);
+        if (std::get<0>(batch_element) == this_head_src &&
+            std::get<1>(batch_element) < head) {
+          break;
+        }
+        if (std::get<0>(batch_element) < this_head_src) {
+          break;
+        }
+        middle_index -= 1;
+      }
+    }
+  }
+
+  key_type next_head_dest =
+      std::numeric_limits<key_type>::max() >> 1; // max int
+  if (leaf_number + 1 < end_leaf_idx / elts_per_leaf()) {
+    next_head_dest = index_to_head_key(leaf_number + 1);
+    assert(next_head_dest != 0);
+    // this might actually be a sentinal, but thats fine, since in that case its
+    // part of the next node and the src will will us to add what we should
+  }
+
+// in this case we need to figure out what source controls the head of the
+// next leaf, we can just walk forward in the offsets array to do this
+#if DEBUG == 1
+  size_t counter = 0;
+#endif
+  while (
+      next_head_src < num_nodes_pcsr() &&
+      (std::get<0>(get_info_from_raw_pointer(
+           offsets_array.locations[next_head_src + 1])) == leaf_number ||
+       get_info_from_raw_pointer(offsets_array.locations[next_head_src + 1]) ==
+           std::pair(leaf_number + 1, true))) {
+    next_head_src += 1;
+#if DEBUG == 1
+    // just make sure this soesn't turn into an infinite loop, there could
+    // be at most max number of elements, which could be up to num bytes
+    // sentinals in this leaf
+    counter += 1;
+    assert(counter < logN());
+#endif
+  }
+  auto subrange = std::ranges::subrange(es.begin() + middle_index, es.end());
+  assert(leaf_number >= start_leaf_idx / elts_per_leaf());
+  // std::cout << "working on leaf  " << leaf_number << "\n";
+  assert(index_to_head_key(leaf_number) != 0);
+  auto result =
+      get_leaf(leaf_number)
+          .template strip_from_leaf_pcsr<head_form == InPlace, parallel,
+                                         traits::maintain_offsets>(
+              subrange, f, this_head_src, next_head_src, next_head_dest,
+              offsets_array);
+
+  static_assert(!support_rank);
+  num_elts_removed += std::get<1>(result);
+#if DEBUG == 1
+  {
+    size_t num_marked = 0;
+    for (auto i = middle_index; i < middle_index + std::get<0>(result); i++) {
+      if (std::get<0>(es[i]) >= pcsr_top_bit) {
+        num_marked += 1;
+      }
+    }
+    assert(num_marked == std::get<1>(result));
+  }
+
+#endif
+  auto bytes_used = std::get<2>(result);
+  auto index_removed_up_to = middle_index + std::get<0>(result);
+  if (std::get<1>(result)) {
+    static_assert(!store_density);
+    ASSERT(bytes_used ==
+               get_density_count(
+                   leaf_number * elts_per_leaf() * sizeof(key_type), logN()),
+           "got %lu, expected %lu\n", bytes_used,
+           get_density_count(leaf_number * elts_per_leaf() * sizeof(key_type),
+                             logN()));
+    if (bytes_used < logN() * lower_density_bound(H())) {
+      leaves_to_check.push_back({leaf_number * elts_per_leaf(), bytes_used});
+    }
+  }
+
+  // do the recursion splitting the batch into the early and the late
+
+  uint64_t ret1 = 0;
+  uint64_t ret2 = 0;
+
+  auto early_range =
+      std::ranges::subrange(es.begin(), es.begin() + middle_index);
+  auto late_range =
+      std::ranges::subrange(es.begin() + index_removed_up_to, es.end());
+
+  const auto early_range_start_leaf_idx = start_leaf_idx;
+  const auto early_range_end_leaf_idx = leaf_number * elts_per_leaf();
+  const auto late_range_start_leaf_idx = (leaf_number + 1) * elts_per_leaf();
+  const auto late_range_end_leaf_idx = end_leaf_idx;
+
+  if (early_range.size() == 0 && late_range.size() == 0) {
+    return num_elts_removed;
+  }
+  if (early_range.size() == 0) {
+    ret2 = remove_batch_internal_pcsr(late_range, f, leaves_to_check,
+                                      late_range_start_leaf_idx,
+                                      late_range_end_leaf_idx);
+  } else if (late_range.size() == 0) {
+    ret1 = remove_batch_internal_pcsr(early_range, f, leaves_to_check,
+                                      early_range_start_leaf_idx,
+                                      early_range_end_leaf_idx);
+  } else {
+    if constexpr (!parallel) {
+      ret1 = remove_batch_internal_pcsr(early_range, f, leaves_to_check,
+                                        early_range_start_leaf_idx,
+                                        early_range_end_leaf_idx);
+      ret2 = remove_batch_internal_pcsr(late_range, f, leaves_to_check,
+                                        late_range_start_leaf_idx,
+                                        late_range_end_leaf_idx);
+    } else {
+      if (early_range.size() <= 20 || late_range.size() <= 20) {
+        ret1 = remove_batch_internal_pcsr(early_range, f, leaves_to_check,
+                                          early_range_start_leaf_idx,
+                                          early_range_end_leaf_idx);
+        ret2 = remove_batch_internal_pcsr(late_range, f, leaves_to_check,
+                                          late_range_start_leaf_idx,
+                                          late_range_end_leaf_idx);
+      } else {
+        ParallelTools::par_do(
+            [&]() {
+              ret1 = remove_batch_internal_pcsr(early_range, f, leaves_to_check,
+                                                early_range_start_leaf_idx,
+                                                early_range_end_leaf_idx);
+            },
+            [&]() {
+              ret2 = remove_batch_internal_pcsr(late_range, f, leaves_to_check,
+                                                late_range_start_leaf_idx,
+                                                late_range_end_leaf_idx);
+            });
+      }
+    }
+  }
+
+  num_elts_removed += ret1;
+  num_elts_removed += ret2;
+  return num_elts_removed;
+}
+
+template <typename traits>
+template <std::ranges::random_access_range R>
+uint64_t CPMA<traits>::remove_batch_pcsr(
+    R &es, std::invocable<typename std::ranges::range_value_t<R>> auto &&f,
+    [[maybe_unused]] bool sorted) {
+  // print_pma();
+  // std::cout << "batch\n";
+  // for (const auto &elem : es) {
+  //   std::cout << std::get<0>(elem) << ", " << std::get<1>(elem) << "\n";
+  // }
+  assert(verify_pcsr_nodes());
+  static_assert(!support_rank, "we don't support rank while doing pcsr stuff");
+  uint64_t batch_size = es.size();
+  if (batch_size < 100) {
+    uint64_t count = 0;
+    for (const auto &e : es) {
+      auto elem = f(e);
+      count += remove_pcsr(std::get<0>(elem), std::get<1>(elem));
+    }
+    return count;
+  }
+
+  // the sentinals will always already be there
+  assert(get_element_count() > 0);
+
+  if (!sorted) {
+    parlay::integer_sort_inplace(es, [](const auto &elem) {
+      return (static_cast<uint64_t>(std::get<0>(elem)) << 32U) |
+             std::get<1>(elem);
+    });
+  }
+
+  // don't need to deal with zero since all of the elements will be greater
+  // than zero since we bump up the dests by 1, which is what the f function
+  // does in practice
+
+  std::conditional_t<
+      parallel, ParallelTools::Reducer_Vector<std::pair<uint64_t, uint64_t>>,
+      std::vector<std::pair<uint64_t, uint64_t>>>
+      leaves_to_check;
+
+  const uint64_t num_elts_removed = remove_batch_internal_pcsr(
+      es, f, leaves_to_check, 0, total_leaves() * elts_per_leaf());
+
+  // TODO(wheatman) maybe do this stuff in parallel with some other stuff if we
+  // need more parallelism
+  //   the batch has been marked with the high bit of the src marked if it was
+  //   actually removed, use this to help update the degree array
+  //  TODO(wheatman) this can probably be faster, but its simple and this should
+  //  be a resonable approach
+  auto filtered =
+      parlay::map_maybe(es, [](const auto &elem) -> std::optional<key_type> {
+        if (std::get<0>(elem) >= pcsr_top_bit) {
+          return std::get<0>(elem) ^ pcsr_top_bit;
+        } else {
+          return {};
+        }
+      });
+
+  auto counts = parlay::histogram_by_key(filtered);
+  ParallelTools::parallel_for(0, counts.size(), [&](size_t i) {
+    offsets_array.degrees[counts[i].first] -= counts[i].second;
+  });
+
+  ASSERT(num_elts_removed ==
+             parlay::delayed::reduce(parlay::delayed::map(
+                 counts, [](const auto &elem) { return elem.second; })),
+         "num_elts_removed = %lu, num_marked = %lu\n", num_elts_removed,
+         parlay::delayed::reduce(parlay::delayed::map(
+             counts, [](const auto &elem) { return elem.second; })));
+
+  auto [ranges_to_redistribute_3, full_opt] = get_ranges_to_redistibute(
+      leaves_to_check, num_elts_removed, [&](uint64_t level, float density) {
+        return (density < lower_density_bound(level));
+      });
+  if (full_opt.has_value()) {
+
+    uint64_t shrink_times = 0;
+    auto bytes_occupied = full_opt.value();
+
+    // min bytes necessary to meet the density bound
+    uint64_t bytes_required = bytes_occupied / lower_density_bound(0);
+    if (bytes_required == 0) {
+      bytes_required = 1;
+    }
+
+    while (meta_data[meta_data_index - shrink_times].n >= bytes_required) {
+      shrink_times += 1;
+      if (meta_data_index == shrink_times) {
+        break;
+      }
+    }
+    shrink_list(shrink_times);
+  } else { // not doubling
+    // in parallel, redistribute ranges
+    redistribute_ranges(ranges_to_redistribute_3);
+  }
+  count_elements_ -= num_elts_removed;
+
+  assert(verify_pcsr_nodes());
+  assert(verify_pcsr_degrees());
+#if DEBUG == 1
+  size_t edge_count = 0;
+  for (size_t i = 0; i < num_nodes_pcsr(); i++) {
+    map_neighbors_pcsr<true, false>(
+        i, [&edge_count]([[maybe_unused]] auto args1,
+                         [[maybe_unused]] auto arg2) { edge_count += 1; });
+  }
+  ASSERT(edge_count == num_edges_pcsr(),
+         "edge_count = %lu, num_edges_pcsr() = %lu\n", edge_count,
+         num_edges_pcsr());
+#endif
+  return num_elts_removed;
 }
 
 #endif

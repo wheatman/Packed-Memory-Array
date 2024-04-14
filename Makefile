@@ -14,6 +14,10 @@ STORE_DENSITY?=0
 SUPPORT_RANK?=0
 EXTRA_WARNINGS?=0
 
+ifeq ($(DEBUG),1)
+DEBUG_SYMBOLS = 1
+endif
+
 ifeq ($(CILK),1)
 PARLAY=0
 endif
@@ -151,6 +155,74 @@ define get_test_soa_rule_name
 test_out/basic_soa_$(1)_$(2)/test
 endef
 
+define get_build_rule_pcsr
+
+build/pcsr_$(1)_$(2)_$(3): run_pcsr.cpp include/PMA/internal/leaf.hpp include/PMA/CPMA.hpp include/PMA/PCSR.hpp
+	@mkdir -p build
+	$(CXX) $(CFLAGS) $(DEFINES) -DKEY_TYPE=$(1) -DLEAFFORM=$(2) -DHEADFORM=$(3) -o build/pcsr_$(1)_$(2)_$(3) run_pcsr.cpp $(LDFLAGS)
+endef
+
+define get_build_rule_name_pcsr
+build/pcsr_$(1)_$(2)_$(3)
+endef
+
+define get_test_pcsr_rule
+
+test_out/pcsr_$(1)_$(2)_$(3)/graph: build/pcsr_$(1)_$(2)_$(3)
+	@mkdir -p test_out/prcs_$(1)_$(2)_$(3)
+	./build/pcsr_$(1)_$(2)_$(3) EdgeMapVertexMap/data/slashdot.adj 1 1 > /dev/null
+	@diff -q bfs.out EdgeMapVertexMap/correct_output/slashdot/bfs/source1 
+	@diff -q bc.out EdgeMapVertexMap/correct_output/slashdot/bc/source1 
+	@diff -q pr.out EdgeMapVertexMap/correct_output/slashdot/pr/iters10 
+	@diff -q cc.out EdgeMapVertexMap/correct_output/slashdot/cc/output 
+	./build/pcsr_$(1)_$(2)_$(3) EdgeMapVertexMap/data/slashdot.adj 1 2 > /dev/null
+	@diff -q bfs.out EdgeMapVertexMap/correct_output/slashdot/bfs/source2
+	@diff -q bc.out EdgeMapVertexMap/correct_output/slashdot/bc/source2
+	./build/pcsr_$(1)_$(2)_$(3) EdgeMapVertexMap/data/slashdot.adj 1 3 > /dev/null
+	@diff -q bfs.out EdgeMapVertexMap/correct_output/slashdot/bfs/source3
+	@diff -q bc.out EdgeMapVertexMap/correct_output/slashdot/bc/source3
+	./build/pcsr_$(1)_$(2)_$(3) EdgeMapVertexMap/data/slashdot.adj 1 4 > /dev/null
+	@diff -q bfs.out EdgeMapVertexMap/correct_output/slashdot/bfs/source4
+	@diff -q bc.out EdgeMapVertexMap/correct_output/slashdot/bc/source4
+	./build/pcsr_$(1)_$(2)_$(3) EdgeMapVertexMap/data/slashdot.adj 1 5 > /dev/null
+	@diff -q bfs.out EdgeMapVertexMap/correct_output/slashdot/bfs/source5
+	@diff -q bc.out EdgeMapVertexMap/correct_output/slashdot/bc/source5
+endef
+
+define get_test_pcsr_rule_name
+test_out/pcsr_$(1)_$(2)_$(3)/graph
+endef
+
+define get_build_rule_wpcsr
+
+build/wpcsr_$(1)_$(2)_$(3): run_wpcsr.cpp include/PMA/internal/leaf.hpp include/PMA/CPMA.hpp include/PMA/PCSR.hpp
+	@mkdir -p build
+	$(CXX) $(CFLAGS) $(DEFINES) -DKEY_TYPE=$(1) -DWEIGHT_TYPE=$(2) -DHEADFORM=$(3)   -o build/wpcsr_$(1)_$(2)_$(3) run_wpcsr.cpp $(LDFLAGS)
+endef
+
+define get_build_rule_name_wpcsr
+build/wpcsr_$(1)_$(2)_$(3)
+endef
+
+define get_test_wpcsr_rule
+
+test_out/wpcsr_$(1)_$(2)_$(3)/graph: build/wpcsr_$(1)_$(2)_$(3)
+	@mkdir -p test_out/wprcs_$(1)_$(2)_$(3)
+	./build/wpcsr_$(1)_$(2)_$(3) EdgeMapVertexMap/data/slashdot_weights.adj 1 1 > /dev/null
+	@diff -q bf.out EdgeMapVertexMap/correct_output/slashdot_weights/bf/source1 
+	./build/wpcsr_$(1)_$(2)_$(3) EdgeMapVertexMap/data/slashdot_weights.adj 1 2 > /dev/null
+	@diff -q bf.out EdgeMapVertexMap/correct_output/slashdot_weights/bf/source2
+	./build/wpcsr_$(1)_$(2)_$(3) EdgeMapVertexMap/data/slashdot_weights.adj 1 3 > /dev/null
+	@diff -q bf.out EdgeMapVertexMap/correct_output/slashdot_weights/bf/source3
+	./build/wpcsr_$(1)_$(2)_$(3) EdgeMapVertexMap/data/slashdot_weights.adj 1 4 > /dev/null
+	@diff -q bf.out EdgeMapVertexMap/correct_output/slashdot_weights/bf/source4
+	./build/wpcsr_$(1)_$(2)_$(3) EdgeMapVertexMap/data/slashdot_weights.adj 1 5 > /dev/null
+	@diff -q bf.out EdgeMapVertexMap/correct_output/slashdot_weights/bf/source5
+endef
+
+define get_test_wpcsr_rule_name
+test_out/wpcsr_$(1)_$(2)_$(3)/graph
+endef
 
 all: basic
 
@@ -178,15 +250,39 @@ $(foreach key_type,$(key_types3),$(foreach head_form,$(head_forms),$(eval $(call
 $(foreach key_type,$(key_types3),$(foreach head_form,$(head_forms),$(eval $(call get_test_soa_rule,$(key_type),$(head_form)))))
 
 
+#pcsr rules
+head_forms_pcsr := InPlace Linear Eytzinger
+key_types_pcsr := uint32_t uint64_t
+leaf_forms_pcsr :=  uncompressed
+
+$(foreach leaf_form,$(leaf_forms_pcsr),$(foreach key_type,$(key_types_pcsr),$(foreach head_form,$(head_forms_pcsr),$(eval $(call get_build_rule_pcsr,$(key_type),$(leaf_form),$(head_form))))))
+
+$(foreach leaf_form,$(leaf_forms_pcsr),$(foreach key_type,$(key_types_pcsr),$(foreach head_form,$(head_forms_pcsr),$(eval $(call get_test_pcsr_rule,$(key_type),$(leaf_form),$(head_form))))))
+
+weight_types_wpcsr := uint16_t uint32_t uint64_t
+
+$(foreach weight_type,$(weight_types_wpcsr),$(foreach key_type,$(key_types_pcsr),$(foreach head_form,$(head_forms_pcsr),$(eval $(call get_build_rule_wpcsr,$(key_type),$(weight_type),$(head_form))))))
+
+$(foreach weight_type,$(weight_types_wpcsr),$(foreach key_type,$(key_types_pcsr),$(foreach head_form,$(head_forms_pcsr),$(eval $(call get_test_wpcsr_rule,$(key_type),$(weight_type),$(head_form))))))
+
+
 
 basic : $(foreach leaf_form,$(leaf_forms),$(foreach key_type,$(key_types),$(foreach head_form,$(head_forms),$(call get_build_rule_name,$(key_type),$(leaf_form),$(head_form))))) $(foreach key_type,$(key_types2),$(foreach head_form,$(head_forms),$(call get_build_rule_name,$(key_type),uncompressed,$(head_form)))) $(foreach key_type,$(key_types3),$(foreach head_form,$(head_forms),$(call get_build_soa_rule_name,$(key_type),$(head_form)))) 
 
 test : $(foreach leaf_form,$(leaf_forms),$(foreach key_type,$(key_types),$(foreach head_form,$(head_forms),$(call get_test_rule_name,$(key_type),$(leaf_form),$(head_form))))) $(foreach key_type,$(key_types2),$(foreach head_form,$(head_forms),$(call get_test_rule_name,$(key_type),uncompressed,$(head_form)))) $(foreach key_type,$(key_types3),$(foreach head_form,$(head_forms),$(call get_test_soa_rule_name,$(key_type),$(head_form))))
 
 
-soa : run_soa.cpp leaf.hpp CPMA.hpp StructOfArrays/soa.hpp
-	$(CXX) $(CFLAGS) $(DEFINES)   -o soa run_soa.cpp $(LDFLAGS)
+soa : run_soa.cpp include/PMA/internal/leaf.hpp include/PMA/CPMA.hpp StructOfArrays/soa.hpp
+	$(CXX) $(CFLAGS) $(DEFINES) -o soa run_soa.cpp $(LDFLAGS)
  
+
+
+
+pcsr : $(foreach leaf_form,$(leaf_forms_pcsr),$(foreach key_type,$(key_types_pcsr),$(foreach head_form,$(head_forms_pcsr),$(call get_build_rule_name_pcsr,$(key_type),$(leaf_form),$(head_form)))))
+pcsr_test : $(foreach leaf_form,$(leaf_forms_pcsr),$(foreach key_type,$(key_types_pcsr),$(foreach head_form,$(head_forms_pcsr),$(call get_test_pcsr_rule_name,$(key_type),$(leaf_form),$(head_form)))))
+
+wpcsr : $(foreach weight_type,$(weight_types_wpcsr),$(foreach key_type,$(key_types_pcsr),$(foreach head_form,$(head_forms_pcsr),$(call get_build_rule_name_wpcsr,$(key_type),$(weight_type),$(head_form)))))
+wpcsr_test : $(foreach weight_type,$(weight_types_wpcsr),$(foreach key_type,$(key_types_pcsr),$(foreach head_form,$(head_forms_pcsr),$(call get_test_wpcsr_rule_name,$(key_type),$(weight_type),$(head_form)))))
 
 
 clean:

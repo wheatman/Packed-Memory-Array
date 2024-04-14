@@ -2,17 +2,16 @@
 #define HELPERS_H
 
 #include <array>
+#include <assert.h>
 #include <atomic>
 #include <bit>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
-#ifdef __AVX2__
-#include <immintrin.h>
-#endif
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <sstream>
 #include <stdint.h>
 #include <string>
@@ -22,6 +21,10 @@
 #include <utility>
 #include <vector>
 #include <x86intrin.h>
+
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
 #ifndef NDEBUG
 #define ASSERT(PREDICATE, ...)                                                 \
   do {                                                                         \
@@ -37,6 +40,11 @@
 #else
 #define ASSERT(...) // Nothing.
 #endif
+
+template <class T> struct is_unique_ptr : std::false_type {};
+
+template <class T, class D>
+struct is_unique_ptr<std::unique_ptr<T, D>> : std::true_type {};
 
 class __attribute__((__packed__)) uint24_t {
   std::array<uint8_t, 3> data = {0};
@@ -191,9 +199,24 @@ template <class T> inline void Log(const __m128i &value) {
 #endif
 
 [[nodiscard]] inline uint64_t e_index(uint64_t index, uint64_t length) {
+  assert(index <= length);
   uint64_t pos_0 = std::countr_zero(~index) + 1;
   uint64_t num_bits = bsr_long(length) + 1;
   return (1UL << (num_bits - pos_0)) + (index >> pos_0) - 1;
+}
+
+[[nodiscard]] inline uint64_t e_index_reverse(const uint64_t head_index,
+                                              const uint64_t length) {
+  uint64_t index = head_index + 1;
+  uint64_t num_bits = bsr_long(length) + 1;
+  uint64_t high_bit_index = bsr_long(index);
+  uint64_t pos_0 = num_bits - high_bit_index;
+  index -= (1UL << (num_bits - pos_0));
+  index <<= pos_0;
+  index += (1UL << (pos_0 - 1)) - 1;
+  ASSERT(e_index(index, length) == head_index, "%lu, %lu, %lu, %lu\n",
+         head_index, length, index, e_index(index, length));
+  return index;
 }
 
 [[nodiscard]] inline uint64_t e_first_left_parent_eindex(uint64_t my_e_index) {
@@ -345,6 +368,37 @@ std::tuple<Args &...> MakeTupleRef(std::tuple<Args...> &tuple) {
   return MakeTupleRef(tuple, std::make_index_sequence<sizeof...(Args)>{});
 }
 
+namespace details {
+template <typename T> auto get_value(const T &t) {
+  if constexpr (is_unique_ptr<T>::value) {
+    if (t) {
+      return *t;
+    } else {
+      return (typename T::element_type)0;
+    }
+  } else {
+    return t;
+  }
+}
+template <typename T1, typename T2>
+bool check_close_enough(const T1 &t1, const T2 &t2) {
+  auto a = get_value(t1);
+  auto b = get_value(t2);
+  if constexpr (std::is_integral_v<decltype(a)> &&
+                std::is_integral_v<decltype(b)>) {
+    return (a == b);
+  } else {
+    if (a == 0 || b == 0) {
+      return (std::abs((double)a + (double)b) < .000000001);
+    } else {
+      auto bigger = (a > b) ? a : b;
+      auto smaller = (a > b) ? b : a;
+      return (bigger / smaller < 1.00000001);
+    }
+  }
+}
+} // namespace details
+
 template <typename T1, typename T2>
 constexpr bool approx_equal_tuple(const T1 &t1, const T2 &t2) {
   static_assert(std::tuple_size_v<T1> == std::tuple_size_v<T2>);
@@ -357,21 +411,25 @@ constexpr bool approx_equal_tuple(const T1 &t1, const T2 &t2) {
     close_enough = approx_equal_tuple(leftshift_tuple(t1), leftshift_tuple(t2));
   }
   // clang-format on
-  if constexpr (std::is_integral_v<std::tuple_element<0, T1>> &&
-                std::is_integral_v<std::tuple_element<0, T2>>) {
-    close_enough &= (std::get<0>(t1) == std::get<0>(t2));
-  } else {
-    auto a = std::get<0>(t1);
-    auto b = std::get<0>(t2);
-    if (a == 0 || b == 0) {
-      close_enough |= (std::abs((double)a + (double)b) < .000000001);
-    } else {
-      auto bigger = (a > b) ? a : b;
-      auto smaller = (a > b) ? b : a;
-      close_enough |= (bigger / smaller < 1.00000001);
-    }
+  return close_enough &=
+         details::check_close_enough(std::get<0>(t1), std::get<0>(t2));
+}
+
+template <int I, typename... T>
+static void tuple_set_and_zero_impl(std::tuple<T...> &location,
+                                    std::tuple<T &...> data) {
+  std::memcpy(&std::get<I>(location), &std::get<I>(data),
+              sizeof(std::get<I>(data)));
+  std::memset(&std::get<I>(data), 0, sizeof(std::get<I>(data)));
+  if constexpr (sizeof...(T) > I + 1) {
+    tuple_set_and_zero_impl<I + 1, T...>(location, data);
   }
-  return close_enough;
+}
+
+template <typename... T>
+static void tuple_set_and_zero(std::tuple<T...> &location,
+                               std::tuple<T &...> data) {
+  return tuple_set_and_zero_impl<0, T...>(location, data);
 }
 
 struct free_delete {
@@ -388,6 +446,41 @@ template <class T> size_t log2_up(T i) {
     a++;
   }
   return a;
+}
+
+template <class T> class pcsr_node_info {
+public:
+  void **locations = nullptr;
+  T *degrees = nullptr;
+  T size = 0;
+};
+
+template <class T>
+static void element_move_function(T elem, void *new_loc,
+                                  const pcsr_node_info<T> &node_info) {
+
+  static constexpr T top_bit = (std::numeric_limits<T>::max() >> 1) + 1;
+  static_assert(std::has_single_bit(top_bit));
+  if (elem >= top_bit) {
+    // shift left and right to clear the highest bit, which we know is 1
+    T index = (elem << 1) >> 1;
+    assert(index < node_info.size);
+    // std::cout << "changing index " << index << " from "
+    //           << node_info.locations[index] << " to " << new_loc << "\n";
+    node_info.locations[index] = new_loc;
+  }
+}
+
+template <class T> static inline auto element_or_first_element(T el) {
+  static constexpr bool tuple_like = requires() {
+    std::tuple_size<T>::value;
+    std::get<0>(el);
+  };
+  if constexpr (tuple_like) {
+    return std::get<0>(el);
+  } else {
+    return el;
+  }
 }
 
 #endif

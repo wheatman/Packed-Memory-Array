@@ -89,7 +89,7 @@ int main([[maybe_unused]] int32_t argc, char *argv[]) {
     }
     if (verify_cpma_different_sizes<
             PMA_traits<uncompressed_leaf<key_type, uint32_t>, head_form, B_size,
-                       store_density, support_rank, false, 0, true,
+                       store_density, support_rank, false, 0, true, false,
                        sum_on_duplicate<std::tuple<key_type &, uint32_t &>,
                                         std::tuple<key_type, uint32_t>>>>(
             {{100, false}, {1000, false}, {10000, false}, {20000, true}})) {

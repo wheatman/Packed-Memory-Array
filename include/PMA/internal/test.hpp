@@ -1485,13 +1485,17 @@ bool verify_leaf(uint32_t size, uint32_t num_ops, uint32_t range_start,
       if (print) {
         std::cout << "inserting " << num << std::endl;
       }
-      leaf.template insert<head_in_place>(num);
+      leaf.template insert<
+          head_in_place,
+          overwrite_on_insert<typename leaf_type::element_ref_type,
+                              typename leaf_type::element_type>,
+          false>(num, {}, nullptr);
       correct.insert(num);
     } else {
       if (print) {
         std::cout << "removing " << num << std::endl;
       }
-      leaf.template remove<head_in_place>(num);
+      leaf.template remove<head_in_place, false>(num, nullptr);
       correct.erase(num);
     }
     if (print > 1) {
@@ -1565,7 +1569,11 @@ bool verify_leaf(uint32_t size, uint32_t num_ops, uint32_t range_start,
     for (auto elt : inputs) {
       auto e = 1 + 1000 * i + elt;
       sum += e;
-      leaf2.template insert<head_in_place>(e);
+      leaf2.template insert<
+          head_in_place,
+          overwrite_on_insert<typename leaf_type::element_ref_type,
+                              typename leaf_type::element_type>,
+          false>(e, {}, nullptr);
     }
     if (print > 1) {
       leaf2.print();
@@ -1594,12 +1602,12 @@ bool verify_leaf(uint32_t size, uint32_t num_ops, uint32_t range_start,
   if (print > 1) {
     result.leaf.print();
   }
-  result.leaf.template split<head_in_place, false, false, false>(
+  result.leaf.template split<head_in_place, false, false, false, false>(
       num_leaves, result.size, size, (typename leaf_type::key_type *)dest_array,
       0,
       [&heads](size_t idx) ->
       typename leaf_type::element_ref_type { return heads[idx]; },
-      nullptr, nullptr, num_leaves);
+      nullptr, nullptr, num_leaves, nullptr);
   uint64_t total_sum = 0;
   for (int i = 0; i < num_leaves; i++) {
     leaf_type leaf2(heads[i], dest_array + (i * size), size);
