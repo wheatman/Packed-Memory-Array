@@ -150,6 +150,8 @@ public:
 #endif
     return ret;
   }
+  size_t get_memory_size() { return pma.get_size(); }
+
   void print() const {
     pma.print_pma();
     T node = 0;
