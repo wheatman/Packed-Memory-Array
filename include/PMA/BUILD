@@ -16,6 +16,18 @@ cc_library(
     ]
 )
 
+cc_library(
+    name = "pcsr",
+    hdrs = ["PCSR.hpp"],
+    deps = [
+        "//PMA/internal:helpers",
+        ":cpma",
+        "//PMA/internal:leaf",
+        "@ParallelTools//ParallelTools:parallel",
+        "@parlaylib//parlay:primitives",
+    ]
+)
+
 package(
     default_visibility = ["//visibility:public"],
 )
