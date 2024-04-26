@@ -2428,6 +2428,19 @@ public:
                                              SOA<key_type, VTs...>>::type;
   element_ref_type head;
 
+private:
+  template <typename... Ts>
+  void set_element_ref_type_directly(std::tuple<Ts &...> head,
+                                     std::tuple<const Ts &...> data) {
+    std::memcpy(&std::get<0>(head), &std::get<0>(data),
+                sizeof(std::get<0>(data)));
+    if constexpr (sizeof...(Ts) > 1) {
+      set_element_ref_type_directly(leftshift_tuple(head),
+                                    leftshift_tuple(data));
+    }
+  }
+
+public:
   T head_key() const { return std::get<0>(head); }
   element_ptr_type array;
 
@@ -3117,7 +3130,7 @@ public:
     uint64_t used_elts = temp_ptr.get_pointer() - temp_arr_start.get_pointer();
     // check if you can fit in the leaf
     if (used_elts <= length_in_elements) {
-      head = *temp_arr_start;
+      set_element_ref_type_directly(head, *temp_arr_start);
       element_move_function(head_key(), &std::get<0>(head), offsets_array);
       for (uint64_t i = 0; i < (used_elts - 1); i++) {
         (array + i).set(temp_arr_start[i + 1]);
@@ -3126,8 +3139,8 @@ public:
                               offsets_array);
       }
       free(temp_arr);
-    } else {                 // special write for when you don't fit
-      head = element_type(); // special case head
+    } else {                  // special write for when you don't fit
+      std::get<0>(head) = {}; // special case head
       assert(used_elts < (uint64_t)std::numeric_limits<T>::max());
       set_out_of_place_used_elements((T)used_elts);
       set_out_of_place_pointer(temp_arr);
