@@ -6306,9 +6306,11 @@ uint64_t CPMA<traits>::insert_batch_pcsr(
         }
       });
   auto counts = parlay::histogram_by_key(filtered);
+  filtered.clear();
   ParallelTools::parallel_for(0, counts.size(), [&](size_t i) {
     offsets_array.degrees[counts[i].first] += counts[i].second;
   });
+  counts.clear();
 
   ASSERT(num_elts_merged ==
              parlay::delayed::reduce(parlay::delayed::map(
