@@ -1075,8 +1075,7 @@ public:
   static constexpr bool compressed = leaf::compressed;
   explicit CPMA();
   // Move constructor
-  CPMA(CPMA &&other)
-  noexcept
+  CPMA(CPMA &&other) noexcept
       : meta_data_index(other.meta_data_index), has_0(other.has_0),
         count_elements_(other.count_elements_),
         underlying_array(other.underlying_array),
@@ -1095,8 +1094,7 @@ public:
     }
   }
   // Copy constructor
-  CPMA(const CPMA &other)
-  noexcept
+  CPMA(const CPMA &other) noexcept
       : meta_data_index(other.meta_data_index), has_0(other.has_0),
         count_elements_(other.count_elements_) {
     if constexpr (fixed_size) {
@@ -6098,7 +6096,7 @@ uint64_t CPMA<traits>::insert_batch_internal_pcsr(
                std::pair(leaf_number, true)) {
       this_head_src -= 1;
 #if DEBUG == 1
-      // just make sure this soesn't turn into an infinite loop, there could
+      // just make sure this doesn't turn into an infinite loop, there could
       // be at most max number of elements, which could be up to num bytes
       // sentinals in this leaf
       counter += 1;
@@ -6110,10 +6108,35 @@ uint64_t CPMA<traits>::insert_batch_internal_pcsr(
     // will go into this leaf now that we know the starting source
     key_type head = index_to_head_key(leaf_number);
     if (head >= pcsr_top_bit) {
-      while (middle_index > 0 &&
-             std::get<0>(f(es[middle_index - 1])) >= this_head_src) {
-        middle_index -= 1;
+#if DEBUG == 1
+      int64_t debug_middle_index = middle_index;
+      while (debug_middle_index > 0 &&
+             std::get<0>(f(es[debug_middle_index - 1])) >= this_head_src) {
+        debug_middle_index -= 1;
       }
+#endif
+      int64_t check_distance = 1;
+      int64_t bottom_range = 0;
+      int64_t top_range = middle_index;
+      while (check_distance < middle_index) {
+        if (std::get<0>(f(es[middle_index - check_distance])) < this_head_src) {
+          bottom_range = middle_index - check_distance + 1;
+          break;
+        }
+        top_range = middle_index - check_distance + 1;
+        check_distance *= 2;
+      }
+      if (bottom_range == top_range) {
+        middle_index = bottom_range;
+      } else {
+        auto it =
+            std::lower_bound(es.begin() + bottom_range, es.begin() + top_range,
+                             this_head_src, [&](const auto &el, auto value) {
+                               return std::get<0>(f(el)) < this_head_src;
+                             });
+        middle_index = it - es.begin();
+      }
+      assert(middle_index == debug_middle_index);
     } else {
       while (middle_index > 0) {
         auto batch_element = f(es[middle_index - 1]);
@@ -6310,7 +6333,6 @@ uint64_t CPMA<traits>::insert_batch_pcsr(
   ParallelTools::parallel_for(0, counts.size(), [&](size_t i) {
     offsets_array.degrees[counts[i].first] += counts[i].second;
   });
-  counts.clear();
 
   ASSERT(num_elts_merged ==
              parlay::delayed::reduce(parlay::delayed::map(
@@ -6318,6 +6340,7 @@ uint64_t CPMA<traits>::insert_batch_pcsr(
          "num_elts_removed = %lu, num_marked = %lu\n", num_elts_merged,
          parlay::delayed::reduce(parlay::delayed::map(
              counts, [](const auto &elem) { return elem.second; })));
+  counts.clear();
 
   auto [ranges_to_redistribute_3, full_opt] = get_ranges_to_redistibute(
       leaves_to_check, num_elts_merged, [&](uint64_t level, float density) {
