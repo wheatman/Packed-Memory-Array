@@ -69,6 +69,7 @@
 
 #include "parlay/internal/group_by.h"
 #include "parlay/primitives.h"
+#include "parlay/slice.h"
 #pragma clang diagnostic pop
 
 #include "internal/helpers.hpp"
@@ -79,7 +80,7 @@ enum HeadForm { InPlace, Linear, Eytzinger, BNary };
 // BNAry has B pointers, and B-1 elements in each block
 
 template <typename T, typename U> struct overwrite_on_insert {
-  constexpr void operator()(T current_value, U new_value) {
+  constexpr void operator()(T current_value, U new_value) const {
     current_value = new_value;
   }
 };
@@ -1137,6 +1138,7 @@ public:
     other.meta_data_index = 0;
     has_0 = other.has_0;
     other.has_0 = false;
+    free(underlying_array);
     underlying_array = other.underlying_array;
     if constexpr (!fixed_size) {
       other.underlying_array = nullptr;
@@ -1145,6 +1147,9 @@ public:
     sorter = other.sorter;
 #endif
     if constexpr (traits::maintain_offsets) {
+      free(offsets_array.locations);
+      free(offsets_array.degrees);
+      offsets_array = other.offsets_array;
       other.offsets_array = pcsr_node_info<key_type>();
     }
     return *this;
@@ -1189,6 +1194,7 @@ public:
     return *this;
   }
   CPMA(key_type *start, key_type *end);
+  CPMA(auto &range);
   ~CPMA() {
     if constexpr (!fixed_size) {
       if constexpr (!binary) {
@@ -1275,7 +1281,9 @@ public:
     return total_size;
   }
 
-  [[nodiscard]] uint64_t get_element_count() const { return count_elements_; }
+  [[nodiscard]] uint64_t get_element_count() const {
+    return count_elements_ + has_0;
+  }
 
   [[nodiscard]] uint64_t sum() const;
   [[nodiscard]] uint64_t sum_serial(int64_t start, int64_t end) const;
@@ -1529,6 +1537,7 @@ public:
   }
   // extra function to help with PCSR
   CPMA(make_pcsr tag, size_t num_nodes);
+  CPMA(make_pcsr tag, size_t num_nodes, const auto &edges);
 
   bool insert_pcsr(key_type src, key_type dest, value_type val);
   bool insert_pcsr(key_type src, key_type dest) {
@@ -2338,6 +2347,100 @@ template <typename traits> CPMA<traits>::CPMA(key_type *start, key_type *end) {
   std::fill((uint8_t *)underlying_array,
             (uint8_t *)underlying_array + underlying_array_size(), 0);
   insert_batch(start, end - start);
+}
+
+template <typename traits> CPMA<traits>::CPMA(auto &range) {
+  static_assert(!traits::maintain_offsets);
+  if constexpr (!fixed_size) {
+    uint64_t allocated_size = underlying_array_size() + 32;
+    if (allocated_size % 32 != 0) {
+      allocated_size += 32 - (allocated_size % 32);
+    }
+    underlying_array = aligned_alloc(32, allocated_size);
+  }
+  std::fill((uint8_t *)underlying_array,
+            (uint8_t *)underlying_array + underlying_array_size(), 0);
+  // TODO(wheatman) get this working for compressed data
+  if constexpr (compressed) {
+    insert_batch(range.data(), range.size());
+  } else {
+    parlay::sort_inplace(range);
+    void *leaf_init = nullptr;
+    element_type zero_element;
+    size_t soa_num_elements;
+    if constexpr (binary) {
+      auto elements = parlay::unique(range);
+      soa_num_elements = elements.size();
+      size_t start_idx = 0;
+      if (elements[0] == 0) {
+        has_0 = true;
+        start_idx = 1;
+        soa_num_elements -= 1;
+      }
+      leaf_init = malloc(SOA_type::get_size_static(soa_num_elements));
+      ParallelTools::parallel_for(start_idx, elements.size(), [&](size_t i) {
+        SOA_type::get_static(leaf_init, soa_num_elements, i - start_idx) =
+            elements[i];
+      });
+
+    } else {
+      auto element_pairs = parlay::delayed_map(range, [](auto elem) {
+        return std::make_pair(std::get<0>(elem), leftshift_tuple(elem));
+      });
+      auto elements = parlay::reduce_by_key(element_pairs, value_update());
+      parlay::sort_inplace(elements);
+      soa_num_elements = elements.size();
+      size_t start_idx = 0;
+      if (std::get<0>(elements[0]) == 0) {
+        has_0 = true;
+        zero_element = elements[0];
+        start_idx = 1;
+        soa_num_elements -= 1;
+      }
+
+      leaf_init = malloc(SOA_type::get_size_static(soa_num_elements));
+      ParallelTools::parallel_for(start_idx, elements.size(), [&](size_t i) {
+        SOA_type::get_static(leaf_init, soa_num_elements, i - start_idx) =
+            std::tuple_cat(std::make_tuple(elements[i].first),
+                           elements[i].second);
+      });
+    }
+    auto leaf_soa = SOA_type(leaf_init, soa_num_elements);
+
+    typename traits::leaf leaf(leaf_soa.get(0), leaf_soa.get_ptr(1),
+                               soa_num_elements * sizeof(key_type));
+
+    size_t bytes_required = soa_num_elements * sizeof(key_type);
+    uint64_t grow_times = 0;
+    while (meta_data[grow_times].n <= bytes_required) {
+      grow_times += 1;
+    }
+    meta_data_index = grow_times;
+    count_elements_ = soa_num_elements;
+
+    // steal an extra few bytes to ensure we never read off the end
+    uint64_t allocated_size = underlying_array_size() + 32;
+    if (allocated_size % 32 != 0) {
+      allocated_size += 32 - (allocated_size % 32);
+    }
+    underlying_array = aligned_alloc(32, allocated_size);
+    if constexpr (head_form != InPlace) {
+      ParallelTools::parallel_for(0, (head_array_size() / sizeof(key_type)),
+                                  [&](size_t i) { head_array()[i] = 0; });
+    }
+    if constexpr (!binary) {
+      if (has_0) {
+        get_zero_el_ref() = zero_element;
+      }
+    }
+    leaf.template split<head_form == InPlace, store_density, support_rank,
+                        parallel, traits::maintain_offsets>(
+        total_leaves(), count_elements_, logN(), get_data_ptr(0), 0,
+        [this](uint64_t index) -> element_ref_type {
+          return index_to_head(index);
+        },
+        density_array(), rank_tree_array(), total_leaves(), offsets_array);
+  }
 }
 
 template <typename traits> bool CPMA<traits>::has(key_type e) const {
@@ -5515,6 +5618,167 @@ CPMA<traits>::CPMA([[maybe_unused]] make_pcsr tag, size_t num_nodes) {
 #endif
 
   assert(verify_pcsr_nodes());
+}
+
+// the edges should be sorted
+template <typename traits>
+CPMA<traits>::CPMA([[maybe_unused]] make_pcsr tag, size_t num_nodes,
+                   const auto &edges) {
+  static_assert(traits::maintain_offsets);
+
+  static_assert(!traits::compressed);
+  void *leaf_init = nullptr;
+  size_t soa_num_elements;
+  if constexpr (binary) {
+    auto elements = parlay::unique(edges);
+    soa_num_elements = elements.size() + num_nodes;
+    leaf_init = malloc(SOA_type::get_size_static(soa_num_elements));
+    auto first_src = std::get<0>(elements[0]);
+    // first the sentinals before the first element so the rest can be done in
+    // parallel
+    ParallelTools::parallel_for(0, first_src + 1, [&](size_t i) {
+      SOA_type::get_static_ptr(leaf_init, soa_num_elements, i).zero();
+      std::get<0>(SOA_type::get_static(leaf_init, soa_num_elements, i)) =
+          i | pcsr_top_bit;
+    });
+    // deal with the first element
+    SOA_type::get_static(leaf_init, soa_num_elements, first_src + 1) =
+        leftshift_tuple(elements[0]);
+
+    ParallelTools::parallel_for(1, elements.size(), [&](size_t i) {
+      auto src = std::get<0>(elements[i]);
+      auto prev_src = std::get<0>(elements[i - 1]);
+      if (src != prev_src) {
+        assert(prev_src < src);
+        // add the sentinals that need to be added
+        ParallelTools::parallel_for(prev_src + 1, src + 1, [&](size_t j) {
+          SOA_type::get_static_ptr(leaf_init, soa_num_elements, i + j).zero();
+          std::get<0>(SOA_type::get_static(leaf_init, soa_num_elements,
+                                           i + j)) = j | pcsr_top_bit;
+        });
+      }
+      SOA_type::get_static(leaf_init, soa_num_elements, i + src + 1) =
+          leftshift_tuple(elements[i]);
+    });
+  } else {
+    auto element_pairs = parlay::delayed_map(edges, [](auto elem) {
+      return std::make_pair(
+          std::make_pair(std::get<0>(elem), std::get<1>(elem)),
+          leftshift_tuple(leftshift_tuple(elem)));
+    });
+    struct reduce_helper {
+      value_type identity;
+      value_type operator()(value_type left, value_type right) const {
+        element_type a;
+        element_type b;
+        leftshift_tuple(a) = left;
+        leftshift_tuple(b) = right;
+        element_ref_type a_ = MakeTupleRef(a);
+        value_update()(a_, b);
+        return leftshift_tuple(a);
+      }
+    };
+    auto elements = parlay::reduce_by_key(element_pairs, reduce_helper());
+    parlay::sort_inplace(elements);
+    soa_num_elements = elements.size() + num_nodes;
+    leaf_init = malloc(SOA_type::get_size_static(soa_num_elements));
+    auto first_src = elements[0].first.first;
+    // first the sentinals before the first element so the rest can be done in
+    // parallel
+    ParallelTools::parallel_for(0, first_src + 1, [&](size_t i) {
+      SOA_type::get_static_ptr(leaf_init, soa_num_elements, i).zero();
+      std::get<0>(SOA_type::get_static(leaf_init, soa_num_elements, i)) =
+          i | pcsr_top_bit;
+    });
+    // deal with the first element
+    SOA_type::get_static(leaf_init, soa_num_elements, first_src + 1) =
+        std::tuple_cat(std::make_tuple(elements[0].first.second),
+                       elements[0].second);
+
+    ParallelTools::parallel_for(1, elements.size(), [&](size_t i) {
+      auto src = elements[i].first.first;
+      auto prev_src = elements[i - 1].first.first;
+      if (src != prev_src) {
+        assert(prev_src < src);
+        // add the sentinals that need to be added
+        ParallelTools::parallel_for(prev_src + 1, src + 1, [&](size_t j) {
+          SOA_type::get_static_ptr(leaf_init, soa_num_elements, i + j).zero();
+          std::get<0>(SOA_type::get_static(leaf_init, soa_num_elements,
+                                           i + j)) = j | pcsr_top_bit;
+        });
+      }
+      SOA_type::get_static(leaf_init, soa_num_elements, i + src + 1) =
+          std::tuple_cat(std::make_tuple(elements[i].first.second),
+                         elements[i].second);
+    });
+  }
+
+  auto leaf_soa = SOA_type(leaf_init, soa_num_elements);
+
+  typename traits::leaf leaf(leaf_soa.get(0), leaf_soa.get_ptr(1),
+                             soa_num_elements * sizeof(key_type));
+
+  uint64_t grow_times = 0;
+  auto bytes_occupied = (soa_num_elements + 1) * sizeof(key_type);
+
+  // min bytes necessary to meet the density bound
+  // uint64_t bytes_required = bytes_occupied / upper_density_bound(0);
+  uint64_t bytes_required =
+      std::max(N() * growing_factor, bytes_occupied * growing_factor);
+
+  while (meta_data[grow_times].n <= bytes_required) {
+    grow_times += 1;
+  }
+  meta_data_index = grow_times;
+  has_0 = false;
+  count_elements_ = soa_num_elements;
+
+  // steal an extra few bytes to ensure we never read off the end
+  uint64_t allocated_size = underlying_array_size() + 32;
+  if (allocated_size % 32 != 0) {
+    allocated_size += 32 - (allocated_size % 32);
+  }
+  underlying_array = aligned_alloc(32, allocated_size);
+
+  if constexpr (head_form != InPlace) {
+    ParallelTools::parallel_for(0, (head_array_size() / sizeof(key_type)),
+                                [&](size_t i) { head_array()[i] = 0; });
+  }
+  offsets_array.locations =
+      (void **)malloc((num_nodes + 1) * sizeof(*(offsets_array.locations)));
+  offsets_array.size = num_nodes + 1;
+  offsets_array.locations[num_nodes] = data_array() + soa_num_spots();
+
+  leaf.template split<head_form == InPlace, store_density, support_rank,
+                      parallel, traits::maintain_offsets>(
+      total_leaves(), count_elements_, logN(), get_data_ptr(0), 0,
+      [this](uint64_t index) -> element_ref_type {
+        return index_to_head(index);
+      },
+      density_array(), rank_tree_array(), total_leaves(), offsets_array);
+
+  offsets_array.degrees =
+      (key_type *)malloc((num_nodes + 1) * sizeof(*(offsets_array.degrees)));
+  ParallelTools::parallel_for(0, num_nodes, [&](size_t i) {
+    key_type counted_degree = 0;
+    map_neighbors_pcsr<true, false>(
+        i, [&]([[maybe_unused]] const auto &arg1,
+               [[maybe_unused]] const auto &arg2) { counted_degree += 1; });
+    offsets_array.degrees[i] = counted_degree;
+  });
+
+#if DEBUG == 1
+  if constexpr (!compressed) {
+    for (size_t i = 0; i < num_nodes; i++) {
+      void *loc = offsets_array.locations[i];
+      key_type *loc2 = reinterpret_cast<key_type *>(loc);
+      assert((*loc2) == (pcsr_top_bit | i));
+    }
+  }
+#endif
+
+  assert(verify_pcsr_nodes());
+  assert(verify_pcsr_degrees());
 }
 template <typename traits>
 std::pair<uint64_t, bool>

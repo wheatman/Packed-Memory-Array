@@ -1734,13 +1734,8 @@ bool real_graph(const std::string &filename, int iters = 20,
   auto edges = get_edges_from_file_adj_sym(filename, &num_edges, &num_nodes);
 
   printf("done reading in the file, n = %u, m = %lu\n", num_nodes, num_edges);
-  CPMA<traits> g;
-
   auto start = get_usecs();
-  // for (auto edge : edges) {
-  //   g.insert(edge);
-  // }
-  g.insert_batch(edges.data(), edges.size());
+  CPMA<traits> g(edges);
   auto end = get_usecs();
   printf("inserting the edges took %lums\n", (end - start) / 1000);
   num_nodes = g.num_nodes();
@@ -2081,8 +2076,7 @@ batch_test(size_t num_elements_start, size_t batch_size, size_t num_bits = 40,
       correct.insert(data_start.begin(), data_start.end());
     }
 
-    CPMA<traits> pma;
-    pma.insert_batch(data_start.data(), data_start.size());
+    CPMA<traits> pma(data_start);
     data_start.clear();
     split_cnt.reset();
     size_cnt.reset();

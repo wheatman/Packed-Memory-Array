@@ -9,6 +9,7 @@
 #include "PMA/internal/helpers.hpp"
 #include "PMA/internal/leaf.hpp"
 #include "ParallelTools/parallel.h"
+#include "parlay/primitives.h"
 #include "parlay/sequence.h"
 
 #include "CPMA.hpp"
@@ -60,6 +61,22 @@ public:
   using extra_data_t = std::nullptr_t;
 
   PCSR(T num_nodes) : pma(make_pcsr(), num_nodes) {}
+  template <std::ranges::random_access_range R,
+            typename Projection = std::identity>
+  PCSR(T num_nodes, R edges, bool sorted = false, Projection projection = {})
+      : pma(make_pcsr(), 16) {
+    if (!sorted) {
+      parlay::sort_inplace(edges);
+    }
+    auto maped_edges = parlay::delayed_map(edges, [projection](const auto &e) {
+      auto elem = projection(e);
+      assert(std::get<0>(elem) < top_bit);
+      assert(std::get<1>(elem) < top_bit);
+      std::get<1>(elem) = std::get<1>(elem) + 1;
+      return elem;
+    });
+    pma = CPMA<traits>(make_pcsr(), num_nodes, maped_edges);
+  }
   bool contains(T src, T dest) const {
     assert(src < top_bit);
     assert(dest < top_bit);

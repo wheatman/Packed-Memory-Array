@@ -464,7 +464,8 @@ static void element_move_function(T elem, void *new_loc,
   if (elem >= top_bit) {
     // shift left and right to clear the highest bit, which we know is 1
     T index = (elem << 1) >> 1;
-    assert(index < node_info.size);
+    ASSERT(index < node_info.size, "index = %lu, node_info.size = %lu\n",
+           static_cast<uint64_t>(index), static_cast<uint64_t>(node_info.size));
     // std::cout << "changing index " << index << " from "
     //           << node_info.locations[index] << " to " << new_loc << "\n";
     node_info.locations[index] = new_loc;

@@ -56,10 +56,9 @@ bool real_graph(const std::string &filename, int iters = 20,
     std::cerr << "start node is " << start_node << "\n";
     return false;
   }
-  PCSR_Type g(num_nodes);
 
   auto start = get_usecs();
-  g.insert_batch(edges);
+  PCSR_Type g(num_nodes, edges);
   // for (auto edge : edges) {
   //   g.insert(edge.first, edge.second);
   // }
