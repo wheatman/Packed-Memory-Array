@@ -2430,12 +2430,12 @@ public:
 
 private:
   template <typename... Ts>
-  void set_element_ref_type_directly(std::tuple<Ts &...> head,
+  static void set_element_ref_type_directly(std::tuple<Ts &...> loc,
                                      std::tuple<const Ts &...> data) {
-    std::memcpy(&std::get<0>(head), &std::get<0>(data),
+    std::memcpy(&std::get<0>(loc), &std::get<0>(data),
                 sizeof(std::get<0>(data)));
     if constexpr (sizeof...(Ts) > 1) {
-      set_element_ref_type_directly(leftshift_tuple(head),
+      set_element_ref_type_directly(leftshift_tuple(loc),
                                     leftshift_tuple(data));
     }
   }

@@ -1196,28 +1196,30 @@ public:
   CPMA(key_type *start, key_type *end);
   CPMA(auto &range);
   ~CPMA() {
-    if constexpr (!fixed_size) {
-      if constexpr (!binary) {
-        if constexpr (!std::is_trivial_v<element_type>) {
+    if (underlying_array != nullptr) {
+      if constexpr (!fixed_size) {
+        if constexpr (!binary) {
+          if constexpr (!std::is_trivial_v<element_type>) {
 
-          if constexpr (head_form != InPlace) {
-            ParallelTools::parallel_for(0, num_heads(), [&](size_t i) {
-              if (get_head_ref<0>(i) != 0) {
-                get_head_ptr(i).deconstruct();
+            if constexpr (head_form != InPlace) {
+              ParallelTools::parallel_for(0, num_heads(), [&](size_t i) {
+                if (get_head_ref<0>(i) != 0) {
+                  get_head_ptr(i).deconstruct();
+                }
+              });
+            }
+            if (has_0) {
+              get_zero_el_ptr().deconstruct();
+            }
+            ParallelTools::parallel_for(0, soa_num_spots() - 1, [&](size_t i) {
+              if (get_data_ref<0>(i) != 0) {
+                get_data_ptr(i).deconstruct();
               }
             });
           }
-          if (has_0) {
-            get_zero_el_ptr().deconstruct();
-          }
-          ParallelTools::parallel_for(0, soa_num_spots() - 1, [&](size_t i) {
-            if (get_data_ref<0>(i) != 0) {
-              get_data_ptr(i).deconstruct();
-            }
-          });
         }
+        free(underlying_array);
       }
-      free(underlying_array);
     }
     if constexpr (traits::maintain_offsets) {
       free(offsets_array.locations);
@@ -2351,17 +2353,17 @@ template <typename traits> CPMA<traits>::CPMA(key_type *start, key_type *end) {
 
 template <typename traits> CPMA<traits>::CPMA(auto &range) {
   static_assert(!traits::maintain_offsets);
-  if constexpr (!fixed_size) {
-    uint64_t allocated_size = underlying_array_size() + 32;
-    if (allocated_size % 32 != 0) {
-      allocated_size += 32 - (allocated_size % 32);
-    }
-    underlying_array = aligned_alloc(32, allocated_size);
-  }
-  std::fill((uint8_t *)underlying_array,
-            (uint8_t *)underlying_array + underlying_array_size(), 0);
   // TODO(wheatman) get this working for compressed data
-  if constexpr (compressed) {
+  if constexpr (compressed || fixed_size) {
+    if constexpr (!fixed_size) {
+      uint64_t allocated_size = underlying_array_size() + 32;
+      if (allocated_size % 32 != 0) {
+        allocated_size += 32 - (allocated_size % 32);
+      }
+      underlying_array = aligned_alloc(32, allocated_size);
+    }
+    std::fill((uint8_t *)underlying_array,
+              (uint8_t *)underlying_array + underlying_array_size(), 0);
     insert_batch(range.data(), range.size());
   } else {
     parlay::sort_inplace(range);
@@ -5666,23 +5668,29 @@ CPMA<traits>::CPMA([[maybe_unused]] make_pcsr tag, size_t num_nodes,
           std::make_pair(std::get<0>(elem), std::get<1>(elem)),
           leftshift_tuple(leftshift_tuple(elem)));
     });
-    struct reduce_helper {
-      value_type identity;
-      value_type operator()(value_type left, value_type right) const {
-        element_type a;
-        element_type b;
-        leftshift_tuple(a) = left;
-        leftshift_tuple(b) = right;
-        element_ref_type a_ = MakeTupleRef(a);
-        value_update()(a_, b);
-        return leftshift_tuple(a);
+    auto groups = parlay::group_by_key(element_pairs);
+    auto elements = parlay::map(groups, [](auto &pair) {
+      auto src = pair.first.first;
+      auto dest = pair.first.second;
+      parlay::sort_inplace(pair.second, [](const auto &l, const auto &r) {
+        return std::get<0>(l) < std::get<0>(r);
+      });
+      value_type val = pair.second[0];
+      element_type base = std::tuple_cat(std::make_tuple(dest), pair.second[0]);
+      element_ref_type base_ref = MakeTupleRef(base);
+      for (size_t i = 1; i < pair.second.size(); i++) {
+        value_update()(base_ref,
+                       std::tuple_cat(std::make_tuple(dest), pair.second[i]));
       }
-    };
-    auto elements = parlay::reduce_by_key(element_pairs, reduce_helper());
-    parlay::sort_inplace(elements);
+      return std::tuple_cat(std::make_tuple(src), std::move(base));
+    });
+    parlay::sort_inplace(elements, [](const auto &l, const auto &r) {
+      return std::tie(std::get<0>(l), std::get<1>(l)) <
+             std::tie(std::get<0>(r), std::get<1>(r));
+    });
     soa_num_elements = elements.size() + num_nodes;
     leaf_init = malloc(SOA_type::get_size_static(soa_num_elements));
-    auto first_src = elements[0].first.first;
+    auto first_src = std::get<0>(elements[0]);
     // first the sentinals before the first element so the rest can be done in
     // parallel
     ParallelTools::parallel_for(0, first_src + 1, [&](size_t i) {
@@ -5691,13 +5699,13 @@ CPMA<traits>::CPMA([[maybe_unused]] make_pcsr tag, size_t num_nodes,
           i | pcsr_top_bit;
     });
     // deal with the first element
-    SOA_type::get_static(leaf_init, soa_num_elements, first_src + 1) =
-        std::tuple_cat(std::make_tuple(elements[0].first.second),
-                       elements[0].second);
+    auto l_value = leftshift_tuple(MakeTupleRef(elements[0]));
+    SOA_type::get_static_ptr(leaf_init, soa_num_elements, first_src + 1)
+        .set_and_zero(l_value);
 
     ParallelTools::parallel_for(1, elements.size(), [&](size_t i) {
-      auto src = elements[i].first.first;
-      auto prev_src = elements[i - 1].first.first;
+      auto src = std::get<0>(elements[i]);
+      auto prev_src = std::get<0>(elements[i - 1]);
       if (src != prev_src) {
         assert(prev_src < src);
         // add the sentinals that need to be added
@@ -5707,9 +5715,9 @@ CPMA<traits>::CPMA([[maybe_unused]] make_pcsr tag, size_t num_nodes,
                                            i + j)) = j | pcsr_top_bit;
         });
       }
-      SOA_type::get_static(leaf_init, soa_num_elements, i + src + 1) =
-          std::tuple_cat(std::make_tuple(elements[i].first.second),
-                         elements[i].second);
+      auto l_value = leftshift_tuple(MakeTupleRef(elements[i]));
+      SOA_type::get_static_ptr(leaf_init, soa_num_elements, i + src + 1)
+          .set_and_zero(l_value);
     });
   }
 
@@ -6393,14 +6401,17 @@ uint64_t CPMA<traits>::insert_batch_internal_pcsr(
       if (bottom_range == top_range) {
         middle_index = bottom_range;
       } else {
-        auto it =
-            std::lower_bound(es.begin() + bottom_range, es.begin() + top_range,
-                             this_head_src, [&](const auto &el, auto value) {
-                               return std::get<0>(f(el)) < this_head_src;
-                             });
+        auto it = std::lower_bound(
+            es.begin() + bottom_range, es.begin() + top_range, this_head_src,
+            [&](const auto &el, [[maybe_unused]] auto value) {
+              return std::get<0>(f(el)) < this_head_src;
+            });
         middle_index = it - es.begin();
       }
-      assert(middle_index == debug_middle_index);
+#if DEBUG == 1
+      ASSERT(middle_index == debug_middle_index, "got %ld, expected %ld\n",
+             middle_index, debug_middle_index);
+#endif
     } else {
       while (middle_index > 0) {
         auto batch_element = f(es[middle_index - 1]);
