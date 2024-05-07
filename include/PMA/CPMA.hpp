@@ -1595,17 +1595,18 @@ public:
     for (key_type i = 0; i < num_nodes_pcsr(); i++) {
       void *location = offsets_array.locations[i];
       if (location == nullptr) {
-        std::cout << "sentinal is nullptr\n";
+        std::cout << "sentinal " << i << " is nullptr\n";
         return false;
       }
       key_type element = *((key_type *)location);
       if (element < pcsr_top_bit) {
-        std::cout << "offset location not pointing at a sentinal\n";
+        std::cout << "offset location " << i << " not pointing at a sentinal\n";
         std::cout << i << ", " << element << "\n";
         return false;
       }
       if ((element ^ pcsr_top_bit) != i) {
-        std::cout << "offset location pointing to the wrong sentinal\n";
+        std::cout << "offset location " << i
+                  << " pointing to the wrong sentinal\n";
         return false;
       }
     }
@@ -5663,34 +5664,42 @@ CPMA<traits>::CPMA([[maybe_unused]] make_pcsr tag, size_t num_nodes,
           leftshift_tuple(elements[i]);
     });
   } else {
-    auto element_pairs = parlay::delayed_map(edges, [](auto elem) {
-      return std::make_pair(
-          std::make_pair(std::get<0>(elem), std::get<1>(elem)),
-          leftshift_tuple(leftshift_tuple(elem)));
-    });
-    auto groups = parlay::group_by_key(element_pairs);
-    auto elements = parlay::map(groups, [](auto &pair) {
-      auto src = pair.first.first;
-      auto dest = pair.first.second;
-      parlay::sort_inplace(pair.second, [](const auto &l, const auto &r) {
-        return std::get<0>(l) < std::get<0>(r);
-      });
-      value_type val = pair.second[0];
-      element_type base = std::tuple_cat(std::make_tuple(dest), pair.second[0]);
-      element_ref_type base_ref = MakeTupleRef(base);
-      for (size_t i = 1; i < pair.second.size(); i++) {
-        value_update()(base_ref,
-                       std::tuple_cat(std::make_tuple(dest), pair.second[i]));
-      }
-      return std::tuple_cat(std::make_tuple(src), std::move(base));
-    });
-    parlay::sort_inplace(elements, [](const auto &l, const auto &r) {
-      return std::tie(std::get<0>(l), std::get<1>(l)) <
-             std::tie(std::get<0>(r), std::get<1>(r));
-    });
-    soa_num_elements = elements.size() + num_nodes;
+    auto offsets = parlay::filter(
+        parlay::delayed_tabulate(
+            edges.size(),
+            [&edges](size_t i) {
+              if (i == 0 || std::make_pair(std::get<0>(edges[i]),
+                                           std::get<1>(edges[i])) !=
+                                std::make_pair(std::get<0>(edges[i - 1]),
+                                               std::get<1>(edges[i - 1]))) {
+                return i;
+              } else {
+                return std::numeric_limits<size_t>::max();
+              }
+            }),
+        [](size_t i) { return i < std::numeric_limits<size_t>::max(); });
+    offsets.push_back(edges.size());
+    auto element_srcs =
+        parlay::delayed_tabulate(offsets.size() - 1, [&](size_t i) {
+          size_t start = offsets[i];
+          auto src = std::get<0>(edges[start]);
+          return src;
+        });
+    auto element_values =
+        parlay::delayed_tabulate(offsets.size() - 1, [&](size_t i) {
+          size_t start = offsets[i];
+          size_t end = offsets[i + 1];
+          element_type base = leftshift_tuple(edges[start]);
+          element_ref_type base_ref = MakeTupleRef(base);
+          for (size_t j = start + 1; j < end; j++) {
+            value_update()(base_ref, leftshift_tuple(edges[j]));
+          }
+          return base;
+        });
+
+    soa_num_elements = element_srcs.size() + num_nodes;
     leaf_init = malloc(SOA_type::get_size_static(soa_num_elements));
-    auto first_src = std::get<0>(elements[0]);
+    auto first_src = element_srcs[0];
     // first the sentinals before the first element so the rest can be done in
     // parallel
     ParallelTools::parallel_for(0, first_src + 1, [&](size_t i) {
@@ -5699,13 +5708,13 @@ CPMA<traits>::CPMA([[maybe_unused]] make_pcsr tag, size_t num_nodes,
           i | pcsr_top_bit;
     });
     // deal with the first element
-    auto l_value = leftshift_tuple(MakeTupleRef(elements[0]));
+    auto l_value = element_values[0];
     SOA_type::get_static_ptr(leaf_init, soa_num_elements, first_src + 1)
-        .set_and_zero(l_value);
+        .set_and_zero(MakeTupleRef(l_value));
 
-    ParallelTools::parallel_for(1, elements.size(), [&](size_t i) {
-      auto src = std::get<0>(elements[i]);
-      auto prev_src = std::get<0>(elements[i - 1]);
+    ParallelTools::parallel_for(1, element_srcs.size(), [&](size_t i) {
+      auto src = element_srcs[i];
+      auto prev_src = element_srcs[i - 1];
       if (src != prev_src) {
         assert(prev_src < src);
         // add the sentinals that need to be added
@@ -5715,9 +5724,9 @@ CPMA<traits>::CPMA([[maybe_unused]] make_pcsr tag, size_t num_nodes,
                                            i + j)) = j | pcsr_top_bit;
         });
       }
-      auto l_value = leftshift_tuple(MakeTupleRef(elements[i]));
+      auto l_value = element_values[i];
       SOA_type::get_static_ptr(leaf_init, soa_num_elements, i + src + 1)
-          .set_and_zero(l_value);
+          .set_and_zero(MakeTupleRef(l_value));
     });
   }
 
@@ -5764,6 +5773,7 @@ CPMA<traits>::CPMA([[maybe_unused]] make_pcsr tag, size_t num_nodes,
         return index_to_head(index);
       },
       density_array(), rank_tree_array(), total_leaves(), offsets_array);
+  assert(verify_pcsr_nodes());
 
   offsets_array.degrees =
       (key_type *)malloc((num_nodes + 1) * sizeof(*(offsets_array.degrees)));
@@ -5785,7 +5795,6 @@ CPMA<traits>::CPMA([[maybe_unused]] make_pcsr tag, size_t num_nodes,
   }
 #endif
 
-  assert(verify_pcsr_nodes());
   assert(verify_pcsr_degrees());
 }
 template <typename traits>

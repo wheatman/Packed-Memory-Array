@@ -3671,7 +3671,7 @@ public:
           if constexpr (!binary) {
             (merged_mp + start + j).zero();
           }
-          merged_mp[start + j] = ptr_to_temp[j];
+          (merged_mp + start + j).set_and_zero(ptr_to_temp[j]);
         }
 
         ptr_to_temp.free_first(); // release temp storage
@@ -3681,15 +3681,16 @@ public:
           if constexpr (!binary) {
             (merged_mp + start).zero();
           }
-          merged_mp[start] = index_to_head(leaf_start_index + i);
+          (merged_mp + start).set_and_zero(index_to_head(leaf_start_index + i));
+
           start += 1;
         }
         for (uint64_t j = 0; j < end - start; j++) {
           if constexpr (!binary) {
             (merged_mp + start + j).zero();
           }
-          merged_mp[start + j] =
-              (leaf_data_start - ((head_in_place) ? 1 : 0))[j];
+          (merged_mp + start + j)
+              .set_and_zero((leaf_data_start - ((head_in_place) ? 1 : 0))[j]);
         }
       }
     });

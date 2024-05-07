@@ -63,7 +63,7 @@ public:
   PCSR(T num_nodes) : pma(make_pcsr(), num_nodes) {}
   template <std::ranges::random_access_range R,
             typename Projection = std::identity>
-  PCSR(T num_nodes, R edges, bool sorted = false, Projection projection = {})
+  PCSR(T num_nodes, R &edges, bool sorted = false, Projection projection = {})
       : pma(make_pcsr(), 16) {
     if (!sorted) {
       parlay::sort_inplace(edges);
