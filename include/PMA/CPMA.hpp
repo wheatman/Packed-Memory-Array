@@ -118,8 +118,11 @@ public:
       std::is_invocable_v<value_update, element_ref_type, element_type &>,
       "the value update function must take in a reference to the "
       "current value and the new value by reference");
-
+#if defined(PMA_GROWING_FACTOR)
+  static constexpr double growing_factor = PMA_GROWING_FACTOR;
+#else
   static constexpr double growing_factor = 1.2; // 1.5;
+#endif
 
 #if PARALLEL == 1
   static constexpr bool parallel = parallel_;
