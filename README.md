@@ -5,19 +5,25 @@ This repo contains the code for an optimized packed memory array (PMA).
 It contains 3 major optimizations.  
 
 1. Search Optimization.  Improving the search also speeds up inserts since inserts must perform a search to know where the element is being inserted.  We call the PMA with search optimizations an SPMA
-2. Compression.  We can compress the elements so that the entire PMA takes much less space.  Also this helps the performance of several operations that were previously memory bound since we reduce the memory traffic requirements.  We call a compressed pma a CPMA.
+2. Compression.  We can compress the elements so that the entire PMA takes much less space.  Also, this helps the performance of several operations that were previously memory bound since we reduce the memory traffic requirements.  We call a compressed pma a CPMA.
 3. Batch updates.  A new algorithm with algorithmic support for batch updates enables these updates to be much faster and to be parallel.
+
+It also contains the wrapper code to convert the PMA into a graph data structure, PCSR
 
 This README file is broken into two parts, the first is using the Packed Memory Array in general and as part of other systems.  The second is how to run specific benchmarks that were used to test and evaluate the behavior of the PMA, CPMA, and SPMA.
 
+To easily run and use the PMA as a graph data structure I recommend using the [BYO](https://github.com/wheatman/BYO) framework, which has many variations of these PMAs already integrated into the graph benchmark.
+
 ## Using the different variants of PMA's
-The library itself is header only, so you can just `#include` "[CPMA.h](include/PMA/CPMA.hpp)".  
+The library itself is header only, so you can just `#include` "[CPMA.hpp](include/PMA/CPMA.hpp)".  
 
 You will need to download the submodules with
 ```
 git submodule init
 git submodule update
 ```
+
+The graph data structure can similarly be included with `#include` "[PCSR.hpp](include/PMA/PCSR.hpp)".
 
 ### PMA Template Parameters
 
@@ -45,9 +51,10 @@ The options are as follows, as a note some of the options are not fully supporte
  - fixed_size: This boolean specifies that the entire PMA should be stored in a fixed size memory blob on the stack.  This can be useful if you want to use the PMA for something like the nodes in another data structure.
  - max_fixed_size: Specifies how big the PMA is able to grow to if it is being stored in a fixed size blob.
  - parallel_: specifies that the pma is able to parallelize its internal operations 
+ - maintain_offsets: This is used to turn the PMA into the PCSR graph data structure. I highly recommend using the through PCSR.hpp and not directly. 
 
 
- Some examples of defining a PMA from scratch cen be found in the definitions of the predefined ones near the top of [CPMA.h](include/PMA/CPMA.hpp).
+ Some examples of defining a PMA from scratch can be found in the definitions of the predefined ones near the top of [CPMA.hpp](include/PMA/CPMA.hpp).
 
  ### PMA define options
 
@@ -62,20 +69,45 @@ The options are as follows, as a note some of the options are not fully supporte
 - uint64_t size() : The number of elements being stored in the PMA
 - CPMA(): construct an empty PMA
 - CPMA(key_type *start, key_type *end): construct a PMA with the elements in the given range
-- bool has(key_type e): return true if the key `e` is is the PMA
+- bool has(key_type e): return true if the key `e` is in the PMA
 - bool insert(element_type e): inserts the element e into the PMA, returns false if the key was already there.
 - uint64_t insert_batch(element_ptr_type e, uint64_t batch_size, bool sorted = false): inserts a batch of elements of size batch_size
 - uint64_t remove_batch(key_type *e, uint64_t batch_size, bool sorted = false): removes a batch of elements
 - bool remove(key_type e): removes the element with key `e`
 - uint64_t get_size(): returns the amount of memory in bytes used by the PMA
 - uint64_t sum(): Returns the sum of all elements in the PMA
-- key_type max() / min(): returns the smallest or largest key stored in the PMA.
+- key_type max() / min(): returns the smallest or largest key stored in the PMA
 - bool map(F f): runs function f on all elements in the pma
 - parallel_map(F f): runs function f on all elements in the pma in parallel
-- bool map_range(F f, key_type start_key, key_type end_key): runs function f on all elements with keys between start_key and end_key.
+- bool map_range(F f, key_type start_key, key_type end_key): runs function f on all elements with keys between start_key and end_key
 - uint64_t map_range_length(F f, key_type start, uint64_t length): runs function f on at most length elements starting from key at least start
 - The PMA also supports iteration as it has begin and end functions so you can perform operations like `for (auto el : pma)`. Note that this may be slower than using the map functions 
 
+
+
+### PCSR Template Parameters
+The PCSR settings are the same as the standard PMA settings though it sets the argument maintain_offsets to true.  For simplicity a few have already been defined.
+
+- simple_pcsr_settings: which stores an unweighted undirected graph and takes in the single template parameter of which type to store the vertex ids as
+- simple_wpcsr_settings: which stores a weighted undirected graph and takes in both the vertex id type and the weight type
+
+A few notes:
+- Compression does not work with PCSR
+- The top bit from the vertex id is used by the system, so if you have more than 2^31 vertices then you need to use 64 bit vertex ids
+- The graphs are stored undirected, if you want to have directed graphs simply use 2 PCSRs
+
+### PCSR API
+- PCSR(T num_nodes): construct an empty PCSR with the specified number of nodes
+- PCSR(T num_nodes, R &edges, bool sorted = false, Projection projection = {}): construct a PCSR with the specified number of nodes with the set of edges.  This can be faster than constructing an empty one and then inserting the edges as a batch.  `edges` is an arbitrary random access range.  `sorted` is if the edges are already sorted, first by source and then by dest.  `projection` allows a conversion function to be applied to each edge to make it appear as a tuple like type.
+- contains(T src, T dest): returns if the edge is in the structure 
+- insert(T src, T dest): adds the edge to the strucure and returns if it was added, it is not added if it is already there
+- insert(T src, T dest, value_type val): adds a weighted edge.  There is a template parameter to the entire strcuture which allows specifying how to combine weights if an edge is inserted that is already there, by default the old weight is overwritten
+- remove(T src, T dest): remove the specified edge
+- insert_batch(R &es, bool sorted = false, Projection projection = {}): add a batch of edges. `sorted` is if the edges are already sorted, first by source and then by dest.  `projection` allows a conversion function to be applied to each edge to make it appear as a tuple like type.
+- remove_batch(R &es, bool sorted = false): removes a batch of edges. `sorted` is if the edges are already sorted, first by source and then by dest.
+- get_memory_size(): returns the total memory usage in bytes of the structure
+- template <int early_exit, class F> void map_neighbors(uint64_t i, F f, unused, bool run_parallel): runs the given function on all edges of the given vertex. You can specify if early exiting from the map is possible along with if it should be run in parallel. 
+- write_adj_file(filename): writes the graph being stored out to the given file in adj format
 
 
 ## Compile
@@ -347,6 +379,11 @@ Then run the test with
 ./run_batch_updates-CPAM-CPAM-Diff -s <path to graph>
 ```
 
+### Tests for PCSR
+All of the PCSR experiments were run through [BYO](https://github.com/wheatman/BYO)
+
+There is a simpler example test driver for PCSR that can be found at [run_pcsr.cpp](run_pcsr.cpp).  That will make a graph, run a few algorithms and perform some batch inserts.  However, the algorithm times will be slower than using the BYO framework do to worse algorithm implementations. 
+
 
 ### Graph Evaluation for Aspen
 the script to run all the experiments for aspen can be found at `other_systems/aspen/code/run-all.sh`  this will test running on all of the graphs as well as batch updates.
@@ -356,3 +393,41 @@ The graph file format is .adj described at [https://www.cs.cmu.edu/~pbbs/benchma
 
 
 
+
+
+# Citations 
+
+For the search optimization please cite
+
+```
+Wheatman, B., Burns, R., Buluç, A., & Xu, H. (2023). Optimizing Search Layouts in Packed Memory Arrays. In 2023 Proceedings of the Symposium on Algorithm Engineering and Experiments (ALENEX) (pp. 148-161). Society for Industrial and Applied Mathematics.
+```
+
+bibtex
+```
+@inproceedings{wheatman2023optimizing,
+  title={Optimizing Search Layouts in Packed Memory Arrays},
+  author={Wheatman, Brian and Burns, Randal and Bulu{\c{c}}, Ayd{\i}n and Xu, Helen},
+  booktitle={2023 Proceedings of the Symposium on Algorithm Engineering and Experiments (ALENEX)},
+  pages={148--161},
+  year={2023},
+  organization={SIAM}
+}
+```
+
+For the compression or the batch parallel inserts optimizations please cite 
+
+```
+Wheatman, B., Burns, R., Buluc, A., & Xu, H. (2024, March). CPMA: An efficient batch-parallel compressed set without pointers. In Proceedings of the 29th ACM SIGPLAN Annual Symposium on Principles and Practice of Parallel Programming (pp. 348-363).
+```
+
+bibtex
+```
+@inproceedings{wheatman2024cpma,
+  title={CPMA: An efficient batch-parallel compressed set without pointers},
+  author={Wheatman, Brian and Burns, Randal and Buluc, Aydin and Xu, Helen},
+  booktitle={Proceedings of the 29th ACM SIGPLAN Annual Symposium on Principles and Practice of Parallel Programming},
+  pages={348--363},
+  year={2024}
+}
+```
