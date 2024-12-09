@@ -31,27 +31,27 @@ When using a PMA you must select at compile time which variant of the PMA you wa
 
 There are a bunch of predefined ones for each of use, these can be found near the top of [CPMA.h](include/PMA/CPMA.hpp).  A few of the major ones are.
 
- - pma_settings: which is an uncompressed PMA without any search optimization.
- - spmae_settings: which is an uncompressed PMA with a search optimization with the heads stored in Eytzinger order.  This will be much faster for point queries, point updates, and small batch insertions.  There may be a small slowdown in some scan operations. 
- - cpma_settings: which is a compressed PMA without the search optimization
-- scpmae_settings: which is a compressed PMA with a search optimization with the heads stored in Eytzinger order. This will be much faster for point queries, point updates, and small batch insertions.  There may be a small slowdown in some scan operations.
+ - `pma_settings`: which is an uncompressed PMA without any search optimization.
+ - `spmae_settings`: which is an uncompressed PMA with a search optimization with the heads stored in Eytzinger order.  This will be much faster for point queries, point updates, and small batch insertions.  There may be a small slowdown in some scan operations. 
+ - `cpma_settings`: which is a compressed PMA without the search optimization
+- `scpmae_settings`: which is a compressed PMA with a search optimization with the heads stored in Eytzinger order. This will be much faster for point queries, point updates, and small batch insertions.  There may be a small slowdown in some scan operations.
 
 If you want you can also make your own version of the traits class to select your own set of options.
 
 The options are as follows, as a note some of the options are not fully supported and should not be selected.
 
-- l: leaf type, this selects which type of PMA leaf to use as a base.  The two currently supported are `uncompressed_leaf` and `delta_compressed_leaf`, but additional ones could be added.  These options can be further templated by the type of the individual elements.
-- h: HeadForm, this selects what type of heads to use which corresponds to what type of search optimization to use.  The options are 
-    - InPlace: the heads are stored with the leafs which give no search optimization
-    - Linear: The heads are stored together, but in the same order as the heads
-    - Eytzinger: The heads are stored together in Eytzinger order which is normally the fastest in practice.
-    - BNary: The heads are stored together in a static b tree like structure, this has some theoretical benefits of Eytzinger order but in practice does not gain much benefit.  
- - b: If BNary heads are selected then this argument should select what size b to use.  It should be 1 more than a small power of 2, it has been tested with 5, 9, and 17.  If the heads are anything but BNary then this field should be 0.
- - the next two fields, density and rank should be false
- - fixed_size: This boolean specifies that the entire PMA should be stored in a fixed size memory blob on the stack.  This can be useful if you want to use the PMA for something like the nodes in another data structure.
- - max_fixed_size: Specifies how big the PMA is able to grow to if it is being stored in a fixed size blob.
- - parallel_: specifies that the pma is able to parallelize its internal operations 
- - maintain_offsets: This is used to turn the PMA into the PCSR graph data structure. I highly recommend using the through PCSR.hpp and not directly. 
+- `l`: leaf type, this selects which type of PMA leaf to use as a base.  The two currently supported are `uncompressed_leaf` and `delta_compressed_leaf`, but additional ones could be added.  These options can be further templated by the type of the individual elements.
+- `h`: HeadForm, this selects what type of heads to use which corresponds to what type of search optimization to use.  The options are 
+    - `InPlace`: the heads are stored with the leafs which give no search optimization
+    - `Linear`: The heads are stored together, but in the same order as the heads
+    - `Eytzinger`: The heads are stored together in Eytzinger order which is normally the fastest in practice.
+    - `BNary`: The heads are stored together in a static b tree like structure, this has some theoretical benefits of Eytzinger order but in practice does not gain much benefit.  
+ - `b`: If BNary heads are selected then this argument should select what size b to use.  It should be 1 more than a small power of 2, it has been tested with 5, 9, and 17.  If the heads are anything but BNary then this field should be 0.
+ - the next two fields, `density` and `rank` should be false
+ - `fixed_size`: This boolean specifies that the entire PMA should be stored in a fixed size memory blob on the stack.  This can be useful if you want to use the PMA for something like the nodes in another data structure.
+ - `max_fixed_size`: Specifies how big the PMA is able to grow to if it is being stored in a fixed size blob.
+ - `parallel_`: specifies that the pma is able to parallelize its internal operations 
+ - `maintain_offsets`: This is used to turn the PMA into the PCSR graph data structure. I highly recommend using the through PCSR.hpp and not directly. 
 
 
  Some examples of defining a PMA from scratch can be found in the definitions of the predefined ones near the top of [CPMA.hpp](include/PMA/CPMA.hpp).
@@ -59,28 +59,28 @@ The options are as follows, as a note some of the options are not fully supporte
  ### PMA define options
 
  In addition there are a few compile time defines that impact the behavior of the PMA, these are
-- DEBUG: which adds a significant amount of verification of the internal operations.  When this is enabled it will be much slower and no longer follow asymptotic bounds.
-- CILK and PARLAY: these are used by the ParallelTools library, one of the submodules to control the parallelization scheme, only one should be enabled at any time, and if it is enabled it will be used to parallelize the internal operations.  
-- NO_TLX: If this is defined a few internal maps will use std::map instead of tlx::btree_map which can slow down some redistributes for the benefit of having less dependencies.
+- `DEBUG`: which adds a significant amount of verification of the internal operations.  When this is enabled it will be much slower and no longer follow asymptotic bounds.
+- `CILK` and `PARLAY`: these are used by the ParallelTools library, one of the submodules to control the parallelization scheme, only one should be enabled at any time, and if it is enabled it will be used to parallelize the internal operations.  
+- `NO_TLX`: If this is defined a few internal maps will use `std::map` instead of `tlx::btree_map` which can slow down some redistributes for the benefit of having less dependencies.
 
 
 ### PMA API
 
-- uint64_t size() : The number of elements being stored in the PMA
-- CPMA(): construct an empty PMA
-- CPMA(key_type *start, key_type *end): construct a PMA with the elements in the given range
-- bool has(key_type e): return true if the key `e` is in the PMA
-- bool insert(element_type e): inserts the element e into the PMA, returns false if the key was already there.
-- uint64_t insert_batch(element_ptr_type e, uint64_t batch_size, bool sorted = false): inserts a batch of elements of size batch_size
-- uint64_t remove_batch(key_type *e, uint64_t batch_size, bool sorted = false): removes a batch of elements
-- bool remove(key_type e): removes the element with key `e`
-- uint64_t get_size(): returns the amount of memory in bytes used by the PMA
-- uint64_t sum(): Returns the sum of all elements in the PMA
-- key_type max() / min(): returns the smallest or largest key stored in the PMA
-- bool map(F f): runs function f on all elements in the pma
-- parallel_map(F f): runs function f on all elements in the pma in parallel
-- bool map_range(F f, key_type start_key, key_type end_key): runs function f on all elements with keys between start_key and end_key
-- uint64_t map_range_length(F f, key_type start, uint64_t length): runs function f on at most length elements starting from key at least start
+- `uint64_t size()` : The number of elements being stored in the PMA
+- `CPMA()`: construct an empty PMA
+- `CPMA(key_type *start, key_type *end)`: construct a PMA with the elements in the given range
+- `bool has(key_type e)`: return true if the key `e` is in the PMA
+- `bool insert(element_type e)`: inserts the element e into the PMA, returns false if the key was already there.
+- `uint64_t insert_batch(element_ptr_type e, uint64_t batch_size, bool sorted = false)`: inserts a batch of elements of size batch_size
+- `uint64_t remove_batch(key_type *e, uint64_t batch_size, bool sorted = false)`: removes a batch of elements
+- `bool remove(key_type e)`: removes the element with key `e`
+- `uint64_t get_size()`: returns the amount of memory in bytes used by the PMA
+- `uint64_t sum()`: Returns the sum of all elements in the PMA
+- `key_type max()` / `min()`: returns the smallest or largest key stored in the PMA
+- `bool map(F f)`: runs function f on all elements in the pma
+- `parallel_map(F f)`: runs function f on all elements in the pma in parallel
+- `bool map_range(F f, key_type start_key, key_type end_key)`: runs function f on all elements with keys between start_key and end_key
+- `uint64_t map_range_length(F f, key_type start, uint64_t length)`: runs function f on at most length elements starting from key at least start
 - The PMA also supports iteration as it has begin and end functions so you can perform operations like `for (auto el : pma)`. Note that this may be slower than using the map functions 
 
 
@@ -88,8 +88,8 @@ The options are as follows, as a note some of the options are not fully supporte
 ### PCSR Template Parameters
 The PCSR settings are the same as the standard PMA settings though it sets the argument maintain_offsets to true.  For simplicity a few have already been defined.
 
-- simple_pcsr_settings: which stores an unweighted undirected graph and takes in the single template parameter of which type to store the vertex ids as
-- simple_wpcsr_settings: which stores a weighted undirected graph and takes in both the vertex id type and the weight type
+- `simple_pcsr_settings`: which stores an unweighted undirected graph and takes in the single template parameter of which type to store the vertex ids as
+- `simple_wpcsr_settings`: which stores a weighted undirected graph and takes in both the vertex id type and the weight type
 
 A few notes:
 - Compression does not work with PCSR
@@ -97,22 +97,22 @@ A few notes:
 - The graphs are stored undirected, if you want to have directed graphs simply use 2 PCSRs
 
 ### PCSR API
-- PCSR(T num_nodes): construct an empty PCSR with the specified number of nodes
-- PCSR(T num_nodes, R &edges, bool sorted = false, Projection projection = {}): construct a PCSR with the specified number of nodes with the set of edges.  This can be faster than constructing an empty one and then inserting the edges as a batch.  `edges` is an arbitrary random access range.  `sorted` is if the edges are already sorted, first by source and then by dest.  `projection` allows a conversion function to be applied to each edge to make it appear as a tuple like type.
-- contains(T src, T dest): returns if the edge is in the structure 
-- insert(T src, T dest): adds the edge to the strucure and returns if it was added, it is not added if it is already there
-- insert(T src, T dest, value_type val): adds a weighted edge.  There is a template parameter to the entire strcuture which allows specifying how to combine weights if an edge is inserted that is already there, by default the old weight is overwritten
-- remove(T src, T dest): remove the specified edge
-- insert_batch(R &es, bool sorted = false, Projection projection = {}): add a batch of edges. `sorted` is if the edges are already sorted, first by source and then by dest.  `projection` allows a conversion function to be applied to each edge to make it appear as a tuple like type.
-- remove_batch(R &es, bool sorted = false): removes a batch of edges. `sorted` is if the edges are already sorted, first by source and then by dest.
-- get_memory_size(): returns the total memory usage in bytes of the structure
-- template <int early_exit, class F> void map_neighbors(uint64_t i, F f, unused, bool run_parallel): runs the given function on all edges of the given vertex. You can specify if early exiting from the map is possible along with if it should be run in parallel. 
+- `PCSR(T num_nodes)`: construct an empty PCSR with the specified number of nodes
+- `PCSR(T num_nodes, R &edges, bool sorted = false, Projection projection = {})`: construct a PCSR with the specified number of nodes with the set of edges.  This can be faster than constructing an empty one and then inserting the edges as a batch.  `edges` is an arbitrary random access range.  `sorted` is if the edges are already sorted, first by source and then by dest.  `projection` allows a conversion function to be applied to each edge to make it appear as a tuple like type.
+- `contains(T src, T dest)`: returns if the edge is in the structure 
+- `insert(T src, T dest)`: adds the edge to the strucure and returns if it was added, it is not added if it is already there
+- `insert(T src, T dest, value_type val)`: adds a weighted edge.  There is a template parameter to the entire strcuture which allows specifying how to combine weights if an edge is inserted that is already there, by default the old weight is overwritten
+- `remove(T src, T dest)`: remove the specified edge
+- `insert_batch(R &es, bool sorted = false, Projection projection = {})`: add a batch of edges. `sorted` is if the edges are already sorted, first by source and then by dest.  `projection` allows a conversion function to be applied to each edge to make it appear as a tuple like type.
+- `remove_batch(R &es, bool sorted = false)`: removes a batch of edges. `sorted` is if the edges are already sorted, first by source and then by dest.
+- `get_memory_size()`: returns the total memory usage in bytes of the structure
+- `template <int early_exit, class F> void map_neighbors(uint64_t i, F f, unused, bool run_parallel)`: runs the given function on all edges of the given vertex. You can specify if early exiting from the map is possible along with if it should be run in parallel. 
 - write_adj_file(filename): writes the graph being stored out to the given file in adj format
 
 
 ## Compile
 
-This library requires some c++-20 support. It has been tested and works for g++ 11.4 and clang++ 14 and shold work for later ones as well.
+This library requires some c++-20 support. It has been tested and works for g++ 11.4 and clang++ 14 and should work for later ones as well.
 
 You will need to download the submodules with
 ```
@@ -431,3 +431,16 @@ bibtex
   year={2024}
 }
 ```
+
+For PCSR please cite 
+```
+Brian Wheatman, Randal Burns, and Helen Xu, Batch-Parallel Compressed Sparse Row: A Locality-Optimized Dynamic-Graph Representation 2024 IEEE High Performance Extreme Computing Conference (HPEC). IEEE, 2024
+```
+bibtex
+```
+@inproceedings{wheatman2024bpcsr,
+  title={Batch-Parallel Compressed Sparse Row: A Locality-Optimized Dynamic-Graph Representation},
+  author={Wheatman, Brian and Burns, Randal and Xu, Helen},
+  booktitle={2024 IEEE High Performance Extreme Computing Conference (HPEC)},
+  year={2024}
+}
