@@ -1119,13 +1119,13 @@ public:
     if constexpr (traits::maintain_offsets) {
       offsets_array.size = other.offsets_array.size;
       offsets_array.locations =
-          malloc(offsets_array.size * sizeof(*(offsets_array.locations)));
+          (decltype(offsets_array.locations))malloc(offsets_array.size * sizeof(*(offsets_array.locations)));
       offsets_array.degrees =
-          malloc(offsets_array.size * sizeof(*(offsets_array.degrees)));
+          ((decltype(offsets_array.degrees))malloc(offsets_array.size * sizeof(*(offsets_array.degrees)));
       ParallelTools::parallel_for(0, offsets_array.size, [&](size_t i) {
         offsets_array.locations[i] =
             underlying_array_char() +
-            (other.offsets_array.locations[i] - other.underlying_array_char());
+            ((uint8_t*)other.offsets_array.locations[i] - other.underlying_array_char());
         offsets_array.degrees[i] = other.offsets_array.degrees[i];
       });
     }
