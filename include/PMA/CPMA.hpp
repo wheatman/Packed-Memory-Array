@@ -45,6 +45,7 @@
 #pragma clang diagnostic ignored "-Wshadow-field-in-constructor"
 #pragma clang diagnostic ignored "-Wshadow"
 #pragma clang diagnostic ignored "-Wshorten-64-to-32"
+#pragma clang diagnostic ignored "-Wnontrivial-memcall"
 
 #if !defined(NO_TLX)
 #pragma clang diagnostic push
@@ -1110,22 +1111,24 @@ public:
       }
       underlying_array = aligned_alloc(32, allocated_size);
       ParallelTools::parallel_for(
-          0, other.underlying_array_size(),
-          [&](size_t i) { underlying_array[i] = other.underlying_array[i]; });
+          0, other.underlying_array_size(), [&](size_t i) {
+            underlying_array_char()[i] = other.underlying_array_char()[i];
+          });
     }
 #if VQSORT == 1
     sorter = other.sorter;
 #endif
     if constexpr (traits::maintain_offsets) {
       offsets_array.size = other.offsets_array.size;
-      offsets_array.locations =
-          malloc(offsets_array.size * sizeof(*(offsets_array.locations)));
-      offsets_array.degrees =
-          malloc(offsets_array.size * sizeof(*(offsets_array.degrees)));
+      offsets_array.locations = static_cast<void **>(
+          malloc(offsets_array.size * sizeof(*(offsets_array.locations))));
+      offsets_array.degrees = static_cast<key_type *>(
+          malloc(offsets_array.size * sizeof(*(offsets_array.degrees))));
       ParallelTools::parallel_for(0, offsets_array.size, [&](size_t i) {
         offsets_array.locations[i] =
             underlying_array_char() +
-            (other.offsets_array.locations[i] - other.underlying_array_char());
+            (static_cast<uint8_t *>(other.offsets_array.locations[i]) -
+             other.underlying_array_char());
         offsets_array.degrees[i] = other.offsets_array.degrees[i];
       });
     }
@@ -1183,14 +1186,15 @@ public:
 #endif
     if constexpr (traits::maintain_offsets) {
       offsets_array.size = other.offsets_array.size;
-      offsets_array.locations =
-          malloc(offsets_array.size * sizeof(*(offsets_array.locations)));
-      offsets_array.degrees =
-          malloc(offsets_array.size * sizeof(*(offsets_array.degrees)));
+      offsets_array.locations = static_cast<void **>(
+          malloc(offsets_array.size * sizeof(*(offsets_array.locations))));
+      offsets_array.degrees = static_cast<key_type *>(
+          malloc(offsets_array.size * sizeof(*(offsets_array.degrees))));
       ParallelTools::parallel_for(0, offsets_array.size, [&](size_t i) {
         offsets_array.locations[i] =
             underlying_array_char() +
-            (other.offsets_array.locations[i] - other.underlying_array_char());
+            (static_cast<uint8_t *>(other.offsets_array.locations[i]) -
+             other.underlying_array_char());
         offsets_array.degrees[i] = other.offsets_array.degrees[i];
       });
     }
@@ -5564,7 +5568,7 @@ CPMA<traits>::CPMA([[maybe_unused]] make_pcsr tag, size_t num_nodes) {
   typename traits::SOA_type leaf_init(num_nodes);
   ParallelTools::parallel_for(0, num_nodes, [&](size_t i) {
     // the values for the sentinals are zero initialized
-    leaf_init.template get_ptr(i).zero();
+    leaf_init.get_ptr(i).zero();
     std::get<0>(leaf_init.template get<0>(i)) = i | pcsr_top_bit;
   });
   typename traits::leaf leaf(leaf_init.get(0), leaf_init.get_ptr(1),
@@ -5596,8 +5600,8 @@ CPMA<traits>::CPMA([[maybe_unused]] make_pcsr tag, size_t num_nodes) {
     ParallelTools::parallel_for(0, (head_array_size() / sizeof(key_type)),
                                 [&](size_t i) { head_array()[i] = 0; });
   }
-  offsets_array.locations =
-      (void **)malloc((num_nodes + 1) * sizeof(*(offsets_array.locations)));
+  offsets_array.locations = static_cast<void **>(
+      malloc((num_nodes + 1) * sizeof(*(offsets_array.locations))));
   offsets_array.size = num_nodes + 1;
   offsets_array.locations[num_nodes] = data_array() + soa_num_spots();
 
@@ -5764,8 +5768,8 @@ CPMA<traits>::CPMA([[maybe_unused]] make_pcsr tag, size_t num_nodes,
     ParallelTools::parallel_for(0, (head_array_size() / sizeof(key_type)),
                                 [&](size_t i) { head_array()[i] = 0; });
   }
-  offsets_array.locations =
-      (void **)malloc((num_nodes + 1) * sizeof(*(offsets_array.locations)));
+  offsets_array.locations = static_cast<void **>(
+      malloc((num_nodes + 1) * sizeof(*(offsets_array.locations))));
   offsets_array.size = num_nodes + 1;
   offsets_array.locations[num_nodes] = data_array() + soa_num_spots();
 
